@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 營運記帳助理 - 智慧偵測版</title>
+    <title>AI 營運記帳助理 - 專業統計版</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
@@ -22,11 +22,7 @@
             measurementId: "G-XE39NRPN02"
         };
         
-        // ================================================================
-        // 🔑 您的 API Key
-        // ================================================================
         const myApiKey = "AIzaSyAHM7BRSnAwR9HlzCJPh5oSujFkYm115nY"; 
-        // ================================================================
 
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
@@ -35,8 +31,9 @@
 
         let currentUser = null;
         let records = [];
+        let itemChart = null; 
+        let currentEditId = null;
 
-        // 自動登入
         signInAnonymously(auth).catch(e => console.warn("Auth:", e));
 
         onAuthStateChanged(auth, (user) => {
@@ -45,54 +42,49 @@
                 onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'records'), (snapshot) => {
                     records = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     records.sort((a, b) => new Date(b.date) - new Date(a.date));
-                    renderReport();
+                    updateFilterOptions();
+                    
+                    const currentTab = document.querySelector('button[class*="bg-blue-600"]').id.replace('btn-tab-', '');
+                    if (currentTab === 'report') renderReport();
+                    if (currentTab === 'stats') renderItemStats();
                 });
             }
         });
 
-        // 🧠 AI 核心功能：自動偵測可用模型
+        // 🧠 AI 核心功能
         window.analyzeImage = async (base64Data) => {
             if (!myApiKey) return alert("請先設定 API Key！");
 
-            // 1. 先問 Google：我能用什麼模型？
-            let modelName = "models/gemini-1.5-flash"; // 預設值
+            // 顯示 AI 分析中的載入畫面
+            const loadingOverlay = document.getElementById('loading-overlay');
+            loadingOverlay.querySelector('p').innerText = "AI 正在搜尋「日期:」與金額...";
+            loadingOverlay.classList.remove('hidden');
+
+            let modelName = "models/gemini-1.5-flash"; 
             try {
                 const listResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${myApiKey}`);
-                if (!listResp.ok) {
-                    const err = await listResp.json();
-                    throw new Error(`檢查權限失敗 (${listResp.status})：${err.error?.message || "未知錯誤"}`);
+                if (listResp.ok) {
+                    const listData = await listResp.json();
+                    const validModel = listData.models?.find(m => m.name.includes("gemini") && m.supportedGenerationMethods.includes("generateContent"));
+                    if (validModel) modelName = validModel.name;
                 }
-                const listData = await listResp.json();
-                
-                // 找出一個支援 generateContent 的 gemini 模型
-                const validModel = listData.models?.find(m => 
-                    m.name.includes("gemini") && 
-                    m.supportedGenerationMethods.includes("generateContent")
-                );
-                
-                if (validModel) {
-                    console.log("✅ 自動切換至可用模型：", validModel.name);
-                    modelName = validModel.name;
-                } else {
-                    console.warn("⚠️ 找不到合適模型，嘗試使用預設值...");
-                }
+            } catch (e) { console.warn("模型偵測失敗，使用預設值"); }
 
-            } catch (e) {
-                console.error("模型偵測失敗:", e);
-                alert(`API 連線測試失敗！\n錯誤訊息：${e.message}\n\n請檢查 Google Cloud Console 的「憑證」設定，確認 Key 沒有被限制使用範圍。`);
-                return null;
-            }
+            const currentYear = new Date().getFullYear();
 
-            // 2. 使用偵測到的模型進行辨識
             const prompt = `你是一個專業會計助理與JSON產生器。
             請分析這張圖片中的帳單或手寫紀錄。
-            目標：提取「今日總營業額」(revenue) 與 「各品項明細」(items)。
-            請嚴格遵守以下規則：
-            1. 只回傳純 JSON 字串，不要有 markdown 標記 (如 \`\`\`json)。
-            2. 不要回傳任何解釋文字。
-            3. 如果圖片模糊或無法辨識，請回傳空資料結構。
+            
+            目標：
+            1. 提取「帳單日期」(date)：格式為 YYYY-MM-DD。
+               ⚠️ 關鍵指令：請特別搜尋圖片【左下角】位置。尋找「日期:」、「Date:」或類似標籤後面的日期資訊。
+               ⚠️ 年份處理：如果帳單上只有「月/日」(例如 10/25)，請務必使用今年年份 (${currentYear}) 來補全日期 (例如 ${currentYear}-10-25)。
+            2. 提取「今日總營業額」(revenue)。
+            3. 提取「各品項明細」(items)。
+
             JSON 範例格式：
             {
+                "date": "${currentYear}-10-25",
                 "revenue": 5000,
                 "items": [
                     {"name": "雞肉", "qty": 10, "unitPrice": 150, "cost": 1500}
@@ -127,10 +119,12 @@
                 console.error("AI Error:", e);
                 alert(`辨識失敗：${e.message}`);
                 return null; 
+            } finally {
+                // AI 分析結束，隱藏載入畫面 (由 handleFileUpload 接手處理或這裡關閉)
+                // 注意：handleFileUpload 會在 fillEditor 後關閉，這裡先不關閉以免閃爍
             }
         };
 
-        // UI 邏輯保持不變
         window.handleFileUpload = async (e) => {
             const file = e.target.files[0];
             if (!file) return;
@@ -140,13 +134,14 @@
                 document.getElementById('img-preview').src = base64;
                 document.getElementById('preview-box').classList.remove('hidden');
                 document.getElementById('upload-placeholder').classList.add('hidden');
-                document.getElementById('loading-overlay').classList.remove('hidden');
+                
+                // 這裡呼叫 analyzeImage 會顯示 loading
                 try {
                     const data = await window.analyzeImage(base64);
-                    fillEditor(data || { revenue: 0, items: [] }, base64);
+                    fillEditor(data || { revenue: 0, items: [], date: "" }, base64);
                     if(!data) alert("AI 無法識別內容，請手動輸入。");
                 } catch (err) {
-                    fillEditor({ revenue: 0, items: [] }, base64);
+                    fillEditor({ revenue: 0, items: [], date: "" }, base64);
                 } finally {
                     document.getElementById('loading-overlay').classList.add('hidden');
                 }
@@ -156,9 +151,14 @@
 
         function fillEditor(data, base64) {
             document.getElementById('edit-revenue').value = data.revenue || 0;
+            const today = new Date().toISOString().split('T')[0];
+            const aiDate = data.date ? data.date : today;
+            document.getElementById('edit-date').value = aiDate;
+
             const tbody = document.getElementById('edit-items-body');
             tbody.innerHTML = '';
             (data.items?.length ? data.items : [{name:'', qty:1, unitPrice:0, cost:0}]).forEach(i => window.addItemRow(i.name, i.qty, i.unitPrice, i.cost));
+            
             window.tempImage = base64;
             document.getElementById('editor-view').classList.remove('hidden');
             window.recalc();
@@ -196,9 +196,20 @@
             document.getElementById('calc-split').innerText = Math.max(0, profit * 0.5).toLocaleString();
         };
 
+        // 🟢 修正：存檔時顯示 Loading
         window.submitRecord = async () => {
             if (!currentUser && !confirm("⚠️ 未連線至雲端，僅本地操作。繼續？")) return;
+            
             const rev = parseFloat(document.getElementById('edit-revenue').value) || 0;
+            const selectedDate = document.getElementById('edit-date').value; 
+
+            if (!selectedDate) return alert("請確認日期！");
+
+            // 顯示存檔中的載入畫面
+            const loadingOverlay = document.getElementById('loading-overlay');
+            loadingOverlay.querySelector('p').innerText = "☁️ 資料上傳存檔中...";
+            loadingOverlay.classList.remove('hidden');
+
             const items = [];
             let totalCost = 0;
             document.querySelectorAll('#edit-items-body tr').forEach(tr => {
@@ -212,21 +223,72 @@
 
             const record = {
                 revenue: rev, totalCost, profit: rev - totalCost, split: (rev - totalCost) * 0.5,
-                items, market: document.getElementById('diary-market').value, mood: document.getElementById('diary-mood').value,
-                imageBase64: window.tempImage || "", date: new Date().toISOString()
+                items, 
+                market: document.getElementById('diary-market').value, 
+                mood: document.getElementById('diary-mood').value,
+                imageBase64: window.tempImage || "", 
+                date: selectedDate 
             };
 
             try {
-                 await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'records'), record);
-                 alert("儲存成功！"); location.reload();
-            } catch (e) { alert("儲存失敗"); }
+                if (currentEditId) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', currentEditId), record);
+                    alert("✅ 修改成功！");
+                } else {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'records'), record);
+                    alert("✅ 新增成功！");
+                }
+                window.resetEditor();
+                location.reload(); 
+            } catch (e) { 
+                alert("儲存失敗：" + e.message); 
+                loadingOverlay.classList.add('hidden'); // 失敗時要手動關閉，成功的話 reload 會自動重整
+            }
+        };
+
+        window.resetEditor = () => {
+            currentEditId = null;
+            window.tempImage = null;
+            document.getElementById('edit-mode-label').classList.add('hidden');
+            document.getElementById('btn-cancel-edit').classList.add('hidden');
+            document.getElementById('btn-submit').innerText = "儲存";
+            document.getElementById('btn-submit').classList.remove('bg-green-600', 'hover:bg-green-700');
+            document.getElementById('btn-submit').classList.add('bg-blue-600');
+            
+            document.getElementById('edit-revenue').value = 0;
+            document.getElementById('edit-date').value = new Date().toISOString().split('T')[0];
+            
+            document.getElementById('diary-market').selectedIndex = 0;
+            document.getElementById('diary-mood').value = "";
+            document.getElementById('edit-items-body').innerHTML = "";
+            window.addItemRow();
+            document.getElementById('img-preview').src = "";
+            document.getElementById('preview-box').classList.add('hidden');
+            document.getElementById('upload-placeholder').classList.remove('hidden');
+            window.recalc();
         };
 
         window.editRecord = (id) => {
             const r = records.find(rec => rec.id === id);
             if (!r) return;
+            
+            currentEditId = id; 
+            document.getElementById('edit-mode-label').classList.remove('hidden');
+            document.getElementById('edit-mode-label').innerText = `正在修改舊資料`;
+            document.getElementById('btn-cancel-edit').classList.remove('hidden');
+            document.getElementById('btn-submit').innerText = "確認修改";
+            document.getElementById('btn-submit').classList.remove('bg-blue-600');
+            document.getElementById('btn-submit').classList.add('bg-green-600', 'hover:bg-green-700');
+
             window.tempImage = r.imageBase64;
             document.getElementById('edit-revenue').value = r.revenue;
+            
+            if(r.date) {
+                document.getElementById('edit-date').value = r.date.split('T')[0];
+            }
+
+            document.getElementById('diary-market').value = r.market;
+            document.getElementById('diary-mood').value = r.mood;
             const tbody = document.getElementById('edit-items-body');
             tbody.innerHTML = '';
             r.items.forEach(i => window.addItemRow(i.name, i.qty, i.unitPrice, i.cost));
@@ -235,14 +297,23 @@
             document.getElementById('upload-placeholder').classList.toggle('hidden', !!r.imageBase64);
             document.getElementById('editor-view').classList.remove('hidden');
             window.switchTab('record'); window.recalc();
+            document.getElementById('editor-view').scrollIntoView({ behavior: 'smooth' });
         };
 
+        // 🟢 修正：詳情頁面顯示買氣與日記
         window.viewRecordDetails = (id) => {
             const r = records.find(rec => rec.id === id);
             if (!r) return;
-            document.getElementById('view-date').innerText = new Date(r.date).toLocaleDateString();
+            const dateStr = r.date.includes('T') ? new Date(r.date).toLocaleDateString() : r.date;
+            
+            document.getElementById('view-date').innerText = dateStr;
             document.getElementById('view-revenue').innerText = r.revenue.toLocaleString();
             document.getElementById('view-profit').innerText = r.profit.toLocaleString();
+            
+            // 這裡補上資料綁定
+            document.getElementById('view-market').innerText = r.market || "未記錄";
+            document.getElementById('view-mood').innerText = r.mood || "未記錄";
+
             document.getElementById('view-image').src = r.imageBase64 || "";
             document.getElementById('view-image').classList.toggle('hidden', !r.imageBase64);
             document.getElementById('view-no-image').classList.toggle('hidden', !!r.imageBase64);
@@ -251,58 +322,213 @@
         };
 
         window.downloadExcel = () => {
-            if (!records.length) return alert("無資料");
-            const ws = XLSX.utils.json_to_sheet(records.map(r => ({ "日期": new Date(r.date).toLocaleDateString(), "營業額": r.revenue, "淨利": r.profit, "分潤": r.split })));
-            const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "報表"); XLSX.writeFile(wb, `營運報表.xlsx`);
+            const filterVal = document.getElementById('report-filter').value;
+            let exportData = records;
+            if (filterVal !== 'all') {
+                exportData = records.filter(r => r.date.startsWith(filterVal));
+            }
+            if (!exportData.length) return alert("目前篩選範圍無資料");
+            
+            const ws = XLSX.utils.json_to_sheet(exportData.map(r => ({ 
+                "日期": r.date.split('T')[0], 
+                "營業額": r.revenue, 
+                "成本": r.totalCost,
+                "淨利": r.profit, 
+                "分潤": r.split,
+                "心情": r.mood
+            })));
+            const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "報表"); 
+            XLSX.writeFile(wb, `營運報表_${filterVal === 'all' ? '全部' : filterVal}.xlsx`);
         };
 
         window.switchTab = (tab) => {
             document.getElementById('page-record').classList.toggle('hidden', tab !== 'record');
             document.getElementById('page-report').classList.toggle('hidden', tab !== 'report');
-            document.getElementById('btn-tab-record').className = tab === 'record' ? 'flex-1 py-3 text-center bg-blue-600 text-white rounded-xl shadow font-bold transition' : 'flex-1 py-3 text-center text-gray-500 font-bold transition';
-            document.getElementById('btn-tab-report').className = tab === 'report' ? 'flex-1 py-3 text-center bg-blue-600 text-white rounded-xl shadow font-bold transition' : 'flex-1 py-3 text-center text-gray-500 font-bold transition';
+            document.getElementById('page-stats').classList.toggle('hidden', tab !== 'stats');
+
+            ['record', 'report', 'stats'].forEach(t => {
+                const btn = document.getElementById(`btn-tab-${t}`);
+                if (t === tab) {
+                    btn.className = 'flex-1 py-3 text-center bg-blue-600 text-white rounded-xl shadow font-bold transition text-xs sm:text-base';
+                } else {
+                    btn.className = 'flex-1 py-3 text-center text-gray-500 font-bold transition text-xs sm:text-base';
+                }
+            });
+
             if(tab === 'report') renderReport();
+            if(tab === 'stats') renderItemStats();
         };
 
-        function renderReport() {
+        function updateFilterOptions() {
+            const yearSet = new Set();
+            const monthSet = new Set();
+            
+            records.forEach(r => {
+                let dateStr = r.date;
+                if(dateStr.includes('T')) dateStr = dateStr.split('T')[0];
+                const parts = dateStr.split('-');
+                if(parts.length >= 2) {
+                    yearSet.add(parts[0]); // YYYY
+                    monthSet.add(`${parts[0]}-${parts[1]}`); // YYYY-MM
+                }
+            });
+            
+            const sortedYears = Array.from(yearSet).sort().reverse();
+            const sortedMonths = Array.from(monthSet).sort().reverse();
+            
+            let optionsHtml = '<option value="all">📅 全部期間</option>';
+            
+            // 加入年份選項
+            sortedYears.forEach(y => {
+                optionsHtml += `<option value="${y}" class="font-bold text-blue-700">🗓️ ${y}年 (全年)</option>`;
+            });
+            
+            // 加入月份選項
+            sortedMonths.forEach(m => {
+                const [y, mon] = m.split('-');
+                optionsHtml += `<option value="${m}">${y}年 ${mon}月</option>`;
+            });
+
+            const reportFilter = document.getElementById('report-filter');
+            const statsFilter = document.getElementById('stats-filter');
+            
+            if (reportFilter && reportFilter.innerHTML !== optionsHtml) reportFilter.innerHTML = optionsHtml;
+            if (statsFilter && statsFilter.innerHTML !== optionsHtml) statsFilter.innerHTML = optionsHtml;
+        }
+
+        window.renderReport = () => {
+            const filterVal = document.getElementById('report-filter').value;
             const tbody = document.getElementById('report-tbody');
             if (!tbody) return;
             tbody.innerHTML = '';
-            if (records.length === 0) tbody.innerHTML = '<tr><td colspan="5" class="p-10 text-center text-gray-300">無資料</td></tr>';
-            else records.forEach(r => {
-                const tr = document.createElement('tr');
-                tr.className = "border-b hover:bg-gray-50";
-                tr.innerHTML = `
-                    <td class="py-3 px-2">
-                        <div class="font-bold text-gray-800 text-xs sm:text-base">${new Date(r.date).toLocaleDateString()}</div>
-                        <div class="flex gap-2 mt-1">
-                            <button onclick="window.viewRecordDetails('${r.id}')" class="text-[10px] text-green-600 font-bold">詳情</button>
-                            <button onclick="window.editRecord('${r.id}')" class="text-[10px] text-blue-500 font-bold">修改</button>
-                            <button onclick="window.confirmDelete('${r.id}')" class="text-[10px] text-red-400 font-bold">刪除</button>
-                        </div>
-                    </td>
-                    <td class="py-3 px-2 text-right text-xs sm:text-sm">${r.revenue.toLocaleString()}</td>
-                    <td class="py-3 px-2 text-right text-gray-400 text-xs sm:text-sm">${r.totalCost.toLocaleString()}</td>
-                    <td class="py-3 px-2 text-right font-bold text-green-600 text-xs sm:text-sm">${(r.profit || 0).toLocaleString()}</td>
-                    <td class="py-3 px-2 text-right font-bold text-orange-600 text-xs sm:text-sm">${(r.split || 0).toLocaleString()}</td>
-                `;
-                tbody.appendChild(tr);
-            });
-            updateChart();
-        }
+            
+            let displayRecords = records;
+            if (filterVal !== 'all') {
+                displayRecords = records.filter(r => r.date.startsWith(filterVal));
+            }
+            
+            let totalSplit = 0;
+            let totalRevenue = 0;
+            let totalProfit = 0;
+            const itemTotals = {};
 
-        function updateChart() {
-            const stats = {};
-            records.forEach(r => r.items.forEach(i => stats[i.name] = (stats[i.name] || 0) + i.cost));
+            if (displayRecords.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="p-10 text-center text-gray-300">該期間無資料</td></tr>';
+            } else {
+                displayRecords.forEach(r => {
+                    totalSplit += r.split || 0;
+                    totalRevenue += r.revenue || 0;
+                    totalProfit += r.profit || 0;
+                    r.items.forEach(i => itemTotals[i.name] = (itemTotals[i.name] || 0) + i.cost);
+                    
+                    const dateDisplay = r.date.includes('T') ? new Date(r.date).toLocaleDateString() : r.date;
+
+                    const tr = document.createElement('tr');
+                    tr.className = "border-b hover:bg-gray-50";
+                    tr.innerHTML = `
+                        <td class="py-3 px-2">
+                            <div class="font-bold text-gray-800 text-xs sm:text-base">${dateDisplay}</div>
+                            <div class="flex gap-2 mt-1">
+                                <button onclick="window.viewRecordDetails('${r.id}')" class="text-[10px] text-green-600 font-bold">詳情</button>
+                                <button onclick="window.editRecord('${r.id}')" class="text-[10px] text-blue-500 font-bold">修改</button>
+                                <button onclick="window.confirmDelete('${r.id}')" class="text-[10px] text-red-400 font-bold">刪除</button>
+                            </div>
+                        </td>
+                        <td class="py-3 px-2 text-right text-xs sm:text-sm">${r.revenue.toLocaleString()}</td>
+                        <td class="py-3 px-2 text-right text-gray-400 text-xs sm:text-sm">${r.totalCost.toLocaleString()}</td>
+                        <td class="py-3 px-2 text-right font-bold text-green-600 text-xs sm:text-sm">${(r.profit || 0).toLocaleString()}</td>
+                        <td class="py-3 px-2 text-right font-bold text-orange-600 text-xs sm:text-sm">${(r.split || 0).toLocaleString()}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+            
+            document.getElementById('stat-total-split').innerText = Math.max(0, totalSplit).toLocaleString();
+            document.getElementById('stat-total-revenue').innerText = totalRevenue.toLocaleString();
+            document.getElementById('stat-total-profit').innerText = totalProfit.toLocaleString();
+            
+            updateChart(itemTotals);
+        };
+
+        // 📊 改良：品項統計邏輯
+        window.renderItemStats = () => {
+            const filterVal = document.getElementById('stats-filter').value;
+            const tbody = document.getElementById('stats-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+
+            let displayRecords = records;
+            if (filterVal !== 'all') {
+                displayRecords = records.filter(r => r.date.startsWith(filterVal));
+            }
+
+            // 計算區間總計
+            let totalPeriodRevenue = 0;
+            let totalPeriodCost = 0;
+            let totalPeriodProfit = 0;
+            let totalPeriodQty = 0;
+
+            const itemStats = {};
+            displayRecords.forEach(r => {
+                totalPeriodRevenue += (r.revenue || 0);
+                totalPeriodCost += (r.totalCost || 0);
+                totalPeriodProfit += (r.profit || 0);
+
+                r.items.forEach(i => {
+                    const name = i.name;
+                    if (!itemStats[name]) {
+                        itemStats[name] = { qty: 0, revenue: 0 };
+                    }
+                    itemStats[name].qty += (i.qty || 0);
+                    itemStats[name].revenue += (i.cost || 0);
+                    totalPeriodQty += (i.qty || 0);
+                });
+            });
+
+            // 更新頂部資訊卡
+            document.getElementById('card-revenue').innerText = `$${totalPeriodRevenue.toLocaleString()}`;
+            document.getElementById('card-cost').innerText = `$${totalPeriodCost.toLocaleString()}`;
+            document.getElementById('card-profit').innerText = `$${totalPeriodProfit.toLocaleString()}`;
+            document.getElementById('card-qty').innerText = `${totalPeriodQty.toLocaleString()}`;
+
+            // 轉換為陣列並排序 (依銷售數量高到低)
+            const sortedItems = Object.keys(itemStats).map(key => ({
+                name: key,
+                ...itemStats[key]
+            })).sort((a, b) => b.qty - a.qty);
+
+            if (sortedItems.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="p-10 text-center text-gray-300">該期間無銷售資料</td></tr>';
+            } else {
+                sortedItems.forEach((item, index) => {
+                    const tr = document.createElement('tr');
+                    tr.className = "border-b hover:bg-gray-50";
+                    const rank = index < 3 ? ['🥇', '🥈', '🥉'][index] : (index + 1);
+                    tr.innerHTML = `
+                        <td class="py-4 px-4 font-black text-lg text-gray-700 w-16 text-center">${rank}</td>
+                        <td class="py-4 px-2 font-bold text-blue-800 text-sm sm:text-base">${item.name}</td>
+                        <td class="py-4 px-2 text-center font-bold text-gray-600 bg-gray-50 rounded-lg">${item.qty}</td>
+                        <td class="py-4 px-2 text-right font-bold text-green-600">$${item.revenue.toLocaleString()}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+        };
+
+        function updateChart(stats) {
             const ctx = document.getElementById('itemChart')?.getContext('2d');
             if (!ctx) return;
-            new Chart(ctx, { type: 'doughnut', data: { labels: Object.keys(stats), datasets: [{ data: Object.values(stats), backgroundColor: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'] }] }, options: { responsive: true, maintainAspectRatio: false } });
+            if (itemChart) itemChart.destroy();
+            const labels = Object.keys(stats);
+            if (labels.length === 0) return;
+            itemChart = new Chart(ctx, { type: 'doughnut', data: { labels: labels, datasets: [{ data: Object.values(stats), backgroundColor: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#6366f1'] }] }, options: { responsive: true, maintainAspectRatio: false } });
         }
         
         window.confirmDelete = (id) => { if(confirm("確定刪除？")) deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', id)); };
 
         window.addEventListener('load', () => {
             document.getElementById('nav-date').innerText = new Date().toLocaleDateString('zh-TW', { month: 'long', day: 'numeric', weekday: 'long' });
+            document.getElementById('edit-date').value = new Date().toISOString().split('T')[0];
         });
     </script>
     <style>
@@ -315,8 +541,8 @@
 <body class="min-h-screen pb-10">
     <nav class="bg-blue-700 text-white p-4 shadow-lg sticky top-0 z-40 flex justify-between items-center">
         <div class="flex items-center gap-2">
-            <h1 class="text-xl font-bold">📊 家庭營運助理</h1>
-            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">智慧偵測版</div>
+            <h1 class="text-xl font-bold">📊 營運助理</h1>
+            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">專業統計版 v7.2</div>
         </div>
         <div class="flex items-center gap-3">
             <span id="nav-date" class="text-xs opacity-80 hidden sm:inline"></span>
@@ -325,13 +551,15 @@
 
     <main class="max-w-4xl mx-auto p-4 space-y-6">
         <div class="flex bg-white p-1 rounded-2xl shadow-sm border">
-            <button id="btn-tab-record" onclick="switchTab('record')" class="flex-1 py-3 text-center bg-blue-600 text-white rounded-xl font-bold transition">每日記帳</button>
-            <button id="btn-tab-report" onclick="switchTab('report')" class="flex-1 py-3 text-center text-gray-500 font-bold transition">營運報表</button>
+            <button id="btn-tab-record" onclick="switchTab('record')" class="flex-1 py-3 text-center bg-blue-600 text-white rounded-xl font-bold transition text-xs sm:text-base">掃描記帳</button>
+            <button id="btn-tab-report" onclick="switchTab('report')" class="flex-1 py-3 text-center text-gray-500 font-bold transition text-xs sm:text-base">營運報表</button>
+            <button id="btn-tab-stats" onclick="switchTab('stats')" class="flex-1 py-3 text-center text-gray-500 font-bold transition text-xs sm:text-base">品項統計</button>
         </div>
         
+        <!-- 頁面 1: 掃描記帳 -->
         <section id="page-record" class="space-y-4">
             <div class="bg-white p-10 rounded-3xl shadow-sm border-2 border-dashed border-blue-200 text-center cursor-pointer hover:bg-blue-50 transition" onclick="document.getElementById('fileInput').click()">
-                <div id="upload-placeholder"><div class="text-6xl mb-4">📸</div><p class="text-xl font-bold text-gray-700">拍攝今日帳本</p><p class="text-sm text-gray-400">AI 正在幫你辨識單價與金額...</p></div>
+                <div id="upload-placeholder"><div class="text-6xl mb-4">📸</div><p class="text-xl font-bold text-gray-700">拍攝記帳</p><p class="text-sm text-gray-400">AI 正在幫你辨識左下角日期、單價與金額...</p></div>
                 <div id="preview-box" class="hidden"><img id="img-preview" class="max-h-72 mx-auto rounded-2xl shadow-lg mb-4"></div>
                 <input type="file" id="fileInput" class="hidden" accept="image/*" onchange="handleFileUpload(event)">
             </div>
@@ -339,11 +567,18 @@
             <div id="loading-overlay" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center text-white text-center">
                 <div class="bg-white/10 backdrop-blur-md p-10 rounded-3xl shadow-2xl">
                     <div class="inline-block animate-spin text-5xl mb-4">🧠</div>
-                    <p class="text-xl font-bold">AI 正在努力分析中...</p>
+                    <p class="text-xl font-bold">AI 正在搜尋「日期:」與金額...</p>
                 </div>
             </div>
 
-            <div id="editor-view" class="hidden bg-white rounded-3xl shadow-xl p-6 space-y-6 border border-gray-100 animate-in slide-in-from-bottom-4 duration-500">
+            <div id="editor-view" class="hidden bg-white rounded-3xl shadow-xl p-6 space-y-6 border border-gray-100 animate-in slide-in-from-bottom-4 duration-500 relative">
+                <div id="edit-mode-label" class="hidden absolute top-0 left-0 right-0 bg-green-100 text-green-800 text-center py-2 text-sm font-bold rounded-t-3xl">正在修改舊資料</div>
+
+                <div class="bg-yellow-50 p-4 rounded-2xl border border-yellow-100 mt-4">
+                    <label class="block text-sm font-bold text-yellow-800 mb-1">📅 帳單日期 (AI 自動辨識)</label>
+                    <input type="date" id="edit-date" class="w-full bg-transparent font-black text-xl text-gray-700 outline-none focus:border-yellow-400 transition">
+                </div>
+
                 <div class="bg-blue-50 p-5 rounded-2xl border border-blue-100">
                     <label class="block text-sm font-bold text-blue-800">今日總營業額</label>
                     <input type="number" id="edit-revenue" class="w-full text-4xl font-black bg-transparent border-b-2 border-blue-200 focus:border-blue-500 outline-none transition" oninput="window.recalc()">
@@ -378,28 +613,106 @@
                     </select>
                     <textarea id="diary-mood" rows="3" class="w-full border-2 rounded-2xl p-4 bg-gray-50 outline-none focus:border-blue-400 transition" placeholder="有什麼想記下來的事嗎？..."></textarea>
                 </div>
-                <button onclick="window.submitRecord()" class="w-full bg-blue-600 text-white py-5 rounded-3xl font-black text-xl shadow-xl hover:scale-[1.01] transition">儲存並共享報表</button>
+                
+                <div class="flex gap-3">
+                    <button id="btn-cancel-edit" onclick="window.resetEditor()" class="hidden flex-1 bg-gray-200 text-gray-600 py-5 rounded-3xl font-bold text-xl shadow hover:bg-gray-300 transition">取消修改</button>
+                    <!-- 按鈕文字已修改為「儲存」 -->
+                    <button id="btn-submit" onclick="window.submitRecord()" class="flex-[2] bg-blue-600 text-white py-5 rounded-3xl font-black text-xl shadow-xl hover:scale-[1.01] transition">儲存</button>
+                </div>
             </div>
         </section>
 
+        <!-- 頁面 2: 營運報表 -->
         <section id="page-report" class="hidden space-y-6">
+            <div class="flex justify-between items-center bg-white p-4 rounded-2xl shadow-sm border">
+                <h3 class="font-bold text-gray-800 flex items-center gap-2">📊 營運總覽</h3>
+                <select id="report-filter" onchange="window.renderReport()" class="bg-gray-100 border-none text-sm font-bold py-2 px-4 rounded-xl outline-none cursor-pointer hover:bg-gray-200 transition">
+                    <option value="all">📅 全部期間</option>
+                </select>
+            </div>
+
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div class="bg-white p-6 rounded-3xl shadow-sm border">
-                    <h3 class="font-bold text-gray-800 mb-4 flex items-center gap-2 text-sm sm:text-base">📦 支出占比分析</h3>
+                    <h3 class="font-bold text-gray-800 mb-4 flex items-center gap-2 text-sm sm:text-base">📦 支出占比</h3>
                     <div class="chart-container"><canvas id="itemChart"></canvas></div>
                 </div>
-                <div class="bg-white p-8 rounded-3xl shadow-sm border text-center flex flex-col justify-center space-y-4">
-                    <p class="text-gray-400 font-bold">累積總分潤 (50%)</p>
-                    <p id="stat-total-split" class="text-5xl font-black text-blue-600">0</p>
-                    <button onclick="window.downloadExcel()" class="w-full bg-green-600 text-white py-4 rounded-2xl font-bold shadow-lg hover:bg-green-700 transition">📥 導出 Excel 報表</button>
+                <div class="bg-white p-8 rounded-3xl shadow-sm border flex flex-col justify-center space-y-4">
+                    <div class="text-center">
+                        <p class="text-gray-400 font-bold text-xs">累積總分潤 (50%)</p>
+                        <p id="stat-total-split" class="text-4xl font-black text-orange-600">0</p>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 pt-4 border-t">
+                        <div class="text-center">
+                            <p class="text-gray-400 text-xs">總營業額</p>
+                            <p id="stat-total-revenue" class="font-bold text-blue-600">0</p>
+                        </div>
+                        <div class="text-center">
+                            <p class="text-gray-400 text-xs">總淨利</p>
+                            <p id="stat-total-profit" class="font-bold text-green-600">0</p>
+                        </div>
+                    </div>
+                    <button onclick="window.downloadExcel()" class="w-full bg-green-600 text-white py-4 rounded-2xl font-bold shadow-lg hover:bg-green-700 transition mt-2">📥 導出 Excel 報表</button>
                 </div>
             </div>
             <div class="bg-white rounded-3xl shadow-sm border overflow-hidden">
-                <div class="p-5 border-b bg-gray-50"><h3 class="font-bold text-gray-800">📝 營運歷史紀錄</h3></div>
+                <div class="p-5 border-b bg-gray-50 flex justify-between items-center">
+                    <h3 class="font-bold text-gray-800">📝 歷史紀錄明細</h3>
+                    <span class="text-xs text-gray-400">(依日期排序)</span>
+                </div>
                 <div class="overflow-x-auto">
                     <table class="w-full text-left min-w-[500px]">
                         <thead class="bg-white text-xs text-gray-400 font-bold border-b"><tr><th class="p-4">日期</th><th class="p-4 text-right">營業額</th><th class="p-4 text-right">成本</th><th class="p-4 text-right">利潤</th><th class="p-4 text-right">分潤</th></tr></thead>
                         <tbody id="report-tbody" class="divide-y divide-gray-50"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- 頁面 3: 品項統計 (專業版) -->
+        <section id="page-stats" class="hidden space-y-6">
+            <div class="flex justify-between items-center bg-white p-4 rounded-2xl shadow-sm border">
+                <h3 class="font-bold text-gray-800 flex items-center gap-2">🏆 熱銷排行統計</h3>
+                <select id="stats-filter" onchange="window.renderItemStats()" class="bg-gray-100 border-none text-sm font-bold py-2 px-4 rounded-xl outline-none cursor-pointer hover:bg-gray-200 transition">
+                    <option value="all">📅 全部期間</option>
+                </select>
+            </div>
+
+            <!-- 財務總覽卡片 (新增) -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="bg-blue-600 p-5 rounded-2xl shadow-lg text-white">
+                    <p class="text-xs opacity-70 mb-1">總銷售額 (Revenue)</p>
+                    <p id="card-revenue" class="text-2xl font-black">$0</p>
+                </div>
+                <div class="bg-white border p-5 rounded-2xl shadow-sm">
+                    <p class="text-xs text-gray-400 font-bold mb-1">總成本 (Cost)</p>
+                    <p id="card-cost" class="text-2xl font-black text-gray-700">$0</p>
+                </div>
+                <div class="bg-white border p-5 rounded-2xl shadow-sm">
+                    <p class="text-xs text-green-500 font-bold mb-1">總利潤 (Profit)</p>
+                    <p id="card-profit" class="text-2xl font-black text-green-600">$0</p>
+                </div>
+                <div class="bg-white border p-5 rounded-2xl shadow-sm">
+                    <p class="text-xs text-purple-500 font-bold mb-1">銷售總數量</p>
+                    <p id="card-qty" class="text-2xl font-black text-purple-600">0</p>
+                </div>
+            </div>
+
+            <!-- 詳細排行榜表格 -->
+            <div class="bg-white rounded-3xl shadow-sm border overflow-hidden">
+                <div class="p-5 border-b bg-gray-50">
+                    <h3 class="font-bold text-gray-800">📋 詳細銷售排行</h3>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left min-w-[400px]">
+                        <thead class="bg-white text-xs text-gray-400 font-bold border-b">
+                            <tr>
+                                <th class="p-4 w-16 text-center">排名</th>
+                                <th class="p-4">品項名稱</th>
+                                <th class="p-4 text-center">銷售數量</th>
+                                <th class="p-4 text-right">銷售總金額</th>
+                            </tr>
+                        </thead>
+                        <tbody id="stats-tbody" class="divide-y divide-gray-50 text-sm"></tbody>
                     </table>
                 </div>
             </div>
