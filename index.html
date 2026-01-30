@@ -3,14 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 營運記帳助理 - 安全版</title>
+    <title>AI 營運記帳助理 - 雲端同步旗艦版</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyBWrfJ0OkCIMOJw39_HYq4gjTzPP70LODY",
@@ -22,7 +23,6 @@
             measurementId: "G-XE39NRPN02"
         };
         
-        // 🔑 API Key 改為從 LocalStorage 讀取，預設為空
         let myApiKey = localStorage.getItem('user_gemini_api_key') || "";
 
         const app = initializeApp(firebaseConfig);
@@ -32,20 +32,32 @@
 
         let currentUser = null;
         let records = [];
+        let itemMappings = []; // 儲存品項對照表
         let itemChart = null; 
         let currentEditId = null;
+        let currentAnalysisResult = "";
+        let pendingDeleteId = null;
+
+        // 初始載入提示
+        document.addEventListener('DOMContentLoaded', () => {
+            const loader = document.getElementById('initial-loader');
+            if(loader) loader.classList.remove('hidden');
+        });
 
         signInAnonymously(auth).catch(e => console.warn("Auth:", e));
 
         onAuthStateChanged(auth, (user) => {
             currentUser = user;
             if (user) {
+                const loader = document.getElementById('initial-loader');
+                if(loader) loader.classList.add('hidden');
+
+                // 1. 監聽記帳資料
                 onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'records'), (snapshot) => {
                     records = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     records.sort((a, b) => new Date(b.date) - new Date(a.date));
                     updateFilterOptions();
                     
-                    // 確保元素存在才更新
                     const activeBtn = document.querySelector('button[class*="bg-blue-600"]');
                     if(activeBtn) {
                         const currentTab = activeBtn.id.replace('btn-tab-', '');
@@ -53,91 +65,254 @@
                         if (currentTab === 'stats') renderItemStats();
                     }
                 });
+
+                // 2. 🟢 監聽品項對照表 (雲端同步)
+                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'item_mappings'), (snapshot) => {
+                    itemMappings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderMappingList(); // 資料更新時自動刷新 UI
+                });
+
+                // 3. 監聽雲端設定 (API Key)
+                onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'config', 'main'), (docSnap) => {
+                    if (docSnap.exists() && docSnap.data().gemini_api_key) {
+                        const cloudKey = docSnap.data().gemini_api_key;
+                        if (cloudKey !== myApiKey) {
+                            console.log("☁️ 已從雲端同步 API Key");
+                            myApiKey = cloudKey;
+                            localStorage.setItem('user_gemini_api_key', cloudKey);
+                        }
+                    }
+                });
             }
         });
 
-        // 🧠 AI 核心功能
+        // ==========================================
+        // 🧠 AI 核心功能：圖片辨識 (加入對照表邏輯)
+        // ==========================================
         window.analyzeImage = async (base64Data) => {
-            // 重新讀取 Key，確保使用者剛設定完能馬上用
             myApiKey = localStorage.getItem('user_gemini_api_key') || "";
-            
             if (!myApiKey) {
-                alert("⚠️ 請點擊右上角「⚙️」設定您的 Google API Key 才能使用 AI 功能！");
-                window.openSettings(); // 自動打開設定視窗
+                showToast("⚠️ 請先設定 API Key！", "error");
+                window.openSettings(); 
                 return null;
             }
 
-            // 顯示 AI 分析中的載入畫面
             const loadingOverlay = document.getElementById('loading-overlay');
-            loadingOverlay.querySelector('p').innerText = "AI 正在搜尋「日期:」與金額...";
+            loadingOverlay.querySelector('p').innerText = "AI 正在辨識並校正品項名稱...";
             loadingOverlay.classList.remove('hidden');
 
-            let modelName = "models/gemini-1.5-flash"; 
+            const currentYear = new Date().getFullYear();
+            
+            // 🟢 建構對照表提示詞
+            let mappingPrompt = "";
+            if (itemMappings.length > 0) {
+                const mapList = itemMappings.map(m => `"${m.alias}" -> "${m.standardName}"`).join(", ");
+                mappingPrompt = `
+                【重要：品項名稱校正】
+                請參考以下對照表，如果辨識到的文字類似左邊的「別名」，請務必自動轉換為右邊的「標準名稱」：
+                ${mapList}
+                (例如：看到 "g" 或 "guava" 請輸出 "芭樂")`;
+            }
+
+            const prompt = `你是一個專業的記帳助理。請分析這張圖片。這通常是一張包含「進貨/成本明細」的單據，且圖片某處可能寫有當日的「總營業額」。
+            
+            ${mappingPrompt}
+
+            請回傳 JSON 格式資料，包含以下欄位：
+            1. date (字串): 日期，格式 YYYY-MM-DD。請找尋「日期:」標籤。若只有月日，請補上年份 ${currentYear}。
+            2. revenue (數字): 當日總營業額 (Revenue/Total Sales)。如果圖片上有寫「總收」、「營收」、「Total」等金額，請填入此欄位。若找不到明確的營收數字，請回傳 0。
+            3. items (陣列): 這是成本/進貨清單。
+               - name (字串): 品項名稱 (請應用上述的校正規則)
+               - qty (數字): 數量
+               - unitPrice (數字): 單價 (這裡是成本單價)
+               - cost (數字): 該行小計 (qty * unitPrice)
+               - note (字串): 備註/規格 (如無則空字串)
+
+            請只回傳 JSON 字串，不要有 Markdown 標記。`;
+            
+            try {
+                const result = await callGeminiAPI(prompt, base64Data);
+                return JSON.parse(result.replace(/```json|```/gi, "").trim());
+            } catch (e) {
+                showToast(`辨識失敗：${e.message}`, "error");
+                return null;
+            }
+        };
+
+        // ==========================================
+        // 🧠 AI 營運分析
+        // ==========================================
+        window.runAiAnalysis = async () => {
+            const filterSelect = document.getElementById('ai-filter');
+            const filterVal = filterSelect.value;
+            const filterText = filterSelect.options[filterSelect.selectedIndex].text;
+            
+            const isYearly = filterVal.length === 4 && !filterVal.includes('-'); 
+            const isMonthly = filterVal.includes('-');
+
+            let targetRecords = records;
+            if (filterVal !== 'all') {
+                targetRecords = records.filter(r => r.date.startsWith(filterVal));
+            }
+
+            if (targetRecords.length === 0) return showToast("該期間無資料，無法分析。", "error");
+
+            const btnAnalyze = document.getElementById('btn-analyze');
+            const originalBtnText = btnAnalyze.innerHTML;
+            btnAnalyze.innerHTML = "⏳ AI 思考中...";
+            btnAnalyze.disabled = true;
+            btnAnalyze.classList.add('opacity-50', 'cursor-not-allowed');
+
+            const loadingOverlay = document.getElementById('loading-overlay');
+            loadingOverlay.querySelector('p').innerText = "🤖 AI 顧問正在分析成本結構與獲利能力...";
+            loadingOverlay.classList.remove('hidden');
+
+            let totalRev = 0, totalCost = 0, totalProfit = 0;
+            const itemMap = {};
+            const feedbacks = [];
+            
+            targetRecords.forEach(r => {
+                totalRev += r.revenue || 0;
+                totalCost += r.totalCost || 0;
+                totalProfit += r.profit || 0;
+                
+                r.items.forEach(i => {
+                    if(!itemMap[i.name]) itemMap[i.name] = { qty: 0, cost: 0, notes: [] };
+                    itemMap[i.name].qty += (i.qty || 0);
+                    itemMap[i.name].cost += (i.cost || 0);
+                    if(i.note && i.note.trim() !== "") {
+                        itemMap[i.name].notes.push(i.note);
+                        feedbacks.push(`${i.name}: ${i.note}`);
+                    }
+                });
+            });
+
+            const topCostItems = Object.entries(itemMap)
+                .sort(([,a], [,b]) => b.cost - a.cost)
+                .slice(0, 5)
+                .map(([n, v]) => `${n}($${v.cost})`)
+                .join('; ');
+
+            let promptContext = "";
+            if (isMonthly) {
+                const [year, month] = filterVal.split('-');
+                promptContext = `現在是 ${year}年 ${month}月。請分析該月份的成本控制與獲利狀況，並考慮季節性因素。`;
+            } else if (isYearly) {
+                promptContext = `這是 ${filterVal}年的年度總結。請分析全年度的獲利趨勢與成本結構。`;
+            } else {
+                promptContext = "請進行總體營運分析。";
+            }
+
+            const prompt = `你是一位資深的營運顧問。請根據以下數據進行【${filterText}】的診斷。
+            
+            ${promptContext}
+
+            【營運數據 (此為成本記帳制)】
+            - 總營業額：$${totalRev}
+            - 總成本(進貨/支出)：$${totalCost}
+            - 總淨利：$${totalProfit} (淨利率 ${totalRev > 0 ? ((totalProfit/totalRev)*100).toFixed(1) : 0}%)
+            - 主要成本來源(花費最多)：${topCostItems}
+            - 顧客/營運備註：${feedbacks.slice(0, 5).join('; ') || "無特殊反饋"}
+
+            【輸出要求】
+            請用繁體中文，Markdown 格式：
+            1. 📊 **獲利能力分析**：營收與淨利的比例是否健康？
+            2. 📉 **成本控制建議**：針對主要成本項目，提供節流建議。
+            3. 💡 **營運優化策略**：如何提升下個階段的利潤？
+            4. 💬 **顧客回饋洞察**：針對備註內容給予建議。
+            5. 💪 **暖心鼓勵**：給老闆一句充滿正能量的鼓勵。`;
+
+            try {
+                const result = await callGeminiAPI(prompt, null);
+                const resultContainer = document.getElementById('ai-result-content');
+                resultContainer.innerHTML = marked.parse(result);
+                document.getElementById('ai-result-box').classList.remove('hidden');
+                currentAnalysisResult = result;
+                document.getElementById('btn-save-analysis').classList.remove('hidden');
+            } catch (e) {
+                showToast(`分析失敗：${e.message}`, "error");
+            } finally {
+                loadingOverlay.classList.add('hidden');
+                btnAnalyze.innerHTML = originalBtnText;
+                btnAnalyze.disabled = false;
+                btnAnalyze.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        };
+
+        window.saveAiAnalysis = async () => {
+            if (!currentAnalysisResult) return;
+            const filterVal = document.getElementById('ai-filter').value;
+            const filterText = document.getElementById('ai-filter').options[document.getElementById('ai-filter').selectedIndex].text;
+
+            try {
+                const loadingOverlay = document.getElementById('loading-overlay');
+                loadingOverlay.querySelector('p').innerText = "☁️ 正在儲存分析報告...";
+                loadingOverlay.classList.remove('hidden');
+
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'analyses'), {
+                    date: new Date().toISOString(),
+                    period: filterVal,
+                    periodName: filterText,
+                    content: currentAnalysisResult
+                });
+                showToast("✅ 分析報告已存檔！");
+            } catch (e) {
+                showToast("存檔失敗：" + e.message, "error");
+            } finally {
+                document.getElementById('loading-overlay').classList.add('hidden');
+            }
+        };
+
+        window.exportAiAnalysis = () => {
+            if (!currentAnalysisResult) return showToast("請先執行分析", "error");
+            const textContent = currentAnalysisResult.replace(/[#*`]/g, '');
+            const wb = XLSX.utils.book_new();
+            const ws = XLSX.utils.aoa_to_sheet([["AI 營運分析報告"], [new Date().toLocaleString()], [textContent]]);
+            XLSX.utils.book_append_sheet(wb, ws, "AI分析");
+            XLSX.writeFile(wb, `AI分析報告_${new Date().toISOString().split('T')[0]}.xlsx`);
+        };
+
+        async function callGeminiAPI(prompt, base64Image) {
+            myApiKey = localStorage.getItem('user_gemini_api_key') || "";
+            if (!myApiKey) throw new Error("API Key 未設定");
+
+            let modelName = "models/gemini-1.5-flash";
             try {
                 const listResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${myApiKey}`);
                 if (listResp.ok) {
                     const listData = await listResp.json();
                     const validModel = listData.models?.find(m => m.name.includes("gemini") && m.supportedGenerationMethods.includes("generateContent"));
                     if (validModel) modelName = validModel.name;
-                } else if (listResp.status === 400) {
-                    throw new Error("API Key 無效或已過期，請檢查設定。");
+                } else if (listResp.status === 400 || listResp.status === 403) {
+                    throw new Error("KEY_INVALID");
                 }
-            } catch (e) { console.warn("模型偵測失敗，使用預設值"); }
+            } catch(e) { if(e.message === "KEY_INVALID") throw e; }
 
-            const currentYear = new Date().getFullYear();
-
-            const prompt = `你是一個專業會計助理與JSON產生器。
-            請分析這張圖片中的帳單或手寫紀錄。
-            
-            目標：
-            1. 提取「帳單日期」(date)：格式為 YYYY-MM-DD。
-               ⚠️ 關鍵指令：請特別搜尋圖片【左下角】位置。尋找「日期:」、「Date:」或類似標籤後面的日期資訊。
-               ⚠️ 年份處理：如果帳單上只有「月/日」(例如 10/25)，請務必使用今年年份 (${currentYear}) 來補全日期 (例如 ${currentYear}-10-25)。
-            2. 提取「今日總營業額」(revenue)。
-            3. 提取「各品項明細」(items)。
-
-            JSON 範例格式：
-            {
-                "date": "${currentYear}-10-25",
-                "revenue": 5000,
-                "items": [
-                    {"name": "雞肉", "qty": 10, "unitPrice": 150, "cost": 1500}
-                ]
-            }`;
-            
-            const payload = { 
-                contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: "image/png", data: base64Data.split(',')[1] } }] }],
-                generationConfig: { responseMimeType: "application/json" }
-            };
-            
-            const url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${myApiKey}`;
-            
-            try {
-                const response = await fetch(url, { 
-                    method: 'POST', 
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload) 
-                });
-
-                if (!response.ok) {
-                    const err = await response.json();
-                    throw new Error(err.error?.message || "API 請求失敗");
-                }
-
-                const result = await response.json();
-                const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
-                
-                if (!text) return null;
-                return JSON.parse(text.replace(/```json|```/gi, "").trim());
-            } catch (e) { 
-                console.error("AI Error:", e);
-                alert(`辨識失敗：${e.message}\n(如果是 API Key 問題，請點右上角設定更換)`);
-                return null; 
-            } finally {
-                // AI 分析結束，不在此關閉 loading，由 handleFileUpload 接手
+            const parts = [{ text: prompt }];
+            if (base64Image) {
+                parts.push({ inlineData: { mimeType: "image/png", data: base64Image.split(',')[1] } });
             }
-        };
 
+            const url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${myApiKey}`;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contents: [{ parts }] })
+            });
+
+            if (!response.ok) {
+                if (response.status === 400 || response.status === 403) throw new Error("KEY_INVALID");
+                const err = await response.json();
+                throw new Error(err.error?.message || "API Error");
+            }
+
+            const json = await response.json();
+            return json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        }
+
+        // ==========================================
+        // UI 邏輯
+        // ==========================================
         window.handleFileUpload = async (e) => {
             const file = e.target.files[0];
             if (!file) return;
@@ -150,9 +325,7 @@
                 
                 try {
                     const data = await window.analyzeImage(base64);
-                    // 如果分析回傳 null (例如 key 錯誤)，傳入空資料以避免卡住
                     fillEditor(data || { revenue: 0, items: [], date: "" }, base64);
-                    if(!data && myApiKey) alert("AI 無法識別內容，請手動輸入。");
                 } catch (err) {
                     fillEditor({ revenue: 0, items: [], date: "" }, base64);
                 } finally {
@@ -170,21 +343,24 @@
 
             const tbody = document.getElementById('edit-items-body');
             tbody.innerHTML = '';
-            (data.items?.length ? data.items : [{name:'', qty:1, unitPrice:0, cost:0}]).forEach(i => window.addItemRow(i.name, i.qty, i.unitPrice, i.cost));
+            (data.items?.length ? data.items : [{name:'', qty:1, unitPrice:0, cost:0}]).forEach(i => 
+                window.addItemRow(i.name, i.qty, i.unitPrice, i.note || "")
+            );
             
             window.tempImage = base64;
             document.getElementById('editor-view').classList.remove('hidden');
             window.recalc();
         }
 
-        window.addItemRow = (name = '', qty = 1, unitPrice = 0, cost = 0) => {
+        window.addItemRow = (name = '', qty = 1, unitPrice = 0, note = '') => {
             const tr = document.createElement('tr');
-            tr.className = "border-b border-gray-50";
+            tr.className = "border-b border-gray-50 align-top";
             tr.innerHTML = `
-                <td class="py-3 px-1"><input type="text" value="${name}" class="w-full border rounded p-2 item-name text-xs sm:text-sm" placeholder="品項"></td>
+                <td class="py-3 px-1"><input type="text" value="${name}" class="w-full border rounded p-2 item-name text-xs sm:text-sm" placeholder="品項(成本)"></td>
                 <td class="py-3 px-1"><input type="number" value="${qty}" class="w-full border rounded p-2 item-qty text-center text-xs" oninput="window.rowUpdate(this)"></td>
-                <td class="py-3 px-1"><input type="number" value="${unitPrice}" class="w-full border rounded p-2 item-uprice text-right text-xs" oninput="window.rowUpdate(this)"></td>
-                <td class="py-3 px-1"><input type="number" value="${cost}" class="w-full border rounded p-2 item-cost text-right text-xs bg-gray-50 font-bold" oninput="window.recalc()"></td>
+                <td class="py-3 px-1"><input type="number" value="${unitPrice}" class="w-full border rounded p-2 item-uprice text-right text-xs" placeholder="單價" oninput="window.rowUpdate(this)"></td>
+                <td class="py-3 px-1"><input type="number" value="${qty * unitPrice}" class="w-full border rounded p-2 item-subtotal text-right text-xs bg-gray-50 font-bold" readonly></td>
+                <td class="py-3 px-1"><input type="text" value="${note}" class="w-full border rounded p-2 item-note text-xs text-purple-700 bg-purple-50 placeholder-purple-200" placeholder="備註/客人反應"></td>
                 <td class="py-3 px-1 text-center"><button onclick="this.parentElement.parentElement.remove(); window.recalc()" class="text-red-400 font-bold">✕</button></td>
             `;
             document.getElementById('edit-items-body').appendChild(tr);
@@ -195,16 +371,22 @@
             const tr = input.parentElement.parentElement;
             const qty = parseFloat(tr.querySelector('.item-qty').value) || 0;
             const uprice = parseFloat(tr.querySelector('.item-uprice').value) || 0;
-            tr.querySelector('.item-cost').value = Math.round(qty * uprice);
+            tr.querySelector('.item-subtotal').value = Math.round(qty * uprice);
             window.recalc();
         };
 
         window.recalc = () => {
-            const rev = parseFloat(document.getElementById('edit-revenue').value) || 0;
             let totalCost = 0;
-            document.querySelectorAll('#edit-items-body tr').forEach(tr => totalCost += parseFloat(tr.querySelector('.item-cost').value) || 0);
+            document.querySelectorAll('#edit-items-body tr').forEach(tr => {
+                const qty = parseFloat(tr.querySelector('.item-qty').value) || 0;
+                const uprice = parseFloat(tr.querySelector('.item-uprice').value) || 0;
+                totalCost += (qty * uprice);
+            });
+
+            const revenue = parseFloat(document.getElementById('edit-revenue').value) || 0;
             document.getElementById('calc-cost').innerText = totalCost.toLocaleString();
-            const profit = rev - totalCost;
+            
+            const profit = revenue - totalCost;
             document.getElementById('calc-profit').innerText = profit.toLocaleString();
             document.getElementById('calc-split').innerText = Math.max(0, profit * 0.5).toLocaleString();
         };
@@ -212,12 +394,9 @@
         window.submitRecord = async () => {
             if (!currentUser && !confirm("⚠️ 未連線至雲端，僅本地操作。繼續？")) return;
             
-            const rev = parseFloat(document.getElementById('edit-revenue').value) || 0;
             const selectedDate = document.getElementById('edit-date').value; 
+            if (!selectedDate) return showToast("請確認日期！", "error");
 
-            if (!selectedDate) return alert("請確認日期！");
-
-            // 顯示存檔中的載入畫面
             const loadingOverlay = document.getElementById('loading-overlay');
             loadingOverlay.querySelector('p').innerText = "☁️ 資料上傳存檔中...";
             loadingOverlay.classList.remove('hidden');
@@ -226,15 +405,25 @@
             let totalCost = 0;
             document.querySelectorAll('#edit-items-body tr').forEach(tr => {
                 const name = tr.querySelector('.item-name').value;
-                const cost = parseFloat(tr.querySelector('.item-cost').value) || 0;
+                const qty = parseInt(tr.querySelector('.item-qty').value) || 0;
+                const unitPrice = parseFloat(tr.querySelector('.item-uprice').value) || 0;
+                const note = tr.querySelector('.item-note').value;
+                
                 if(name) { 
-                    items.push({ name, qty: parseInt(tr.querySelector('.item-qty').value)||0, unitPrice: parseFloat(tr.querySelector('.item-uprice').value)||0, cost }); 
-                    totalCost += cost; 
+                    const subtotal = qty * unitPrice;
+                    totalCost += subtotal;
+                    items.push({ name, qty, unitPrice, cost: subtotal, note }); 
                 }
             });
 
+            const revenue = parseFloat(document.getElementById('edit-revenue').value) || 0;
+            const profit = revenue - totalCost;
+
             const record = {
-                revenue: rev, totalCost, profit: rev - totalCost, split: (rev - totalCost) * 0.5,
+                revenue: revenue, 
+                totalCost: totalCost, 
+                profit: profit, 
+                split: profit * 0.5,
                 items, 
                 market: document.getElementById('diary-market').value, 
                 mood: document.getElementById('diary-mood').value,
@@ -245,15 +434,15 @@
             try {
                 if (currentEditId) {
                     await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', currentEditId), record);
-                    alert("✅ 修改成功！");
+                    showToast("✅ 修改成功！");
                 } else {
                     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'records'), record);
-                    alert("✅ 新增成功！");
+                    showToast("✅ 新增成功！");
                 }
                 window.resetEditor();
-                location.reload(); 
+                loadingOverlay.classList.add('hidden'); 
             } catch (e) { 
-                alert("儲存失敗：" + e.message); 
+                showToast("儲存失敗：" + e.message, "error"); 
                 loadingOverlay.classList.add('hidden'); 
             }
         };
@@ -263,6 +452,7 @@
             window.tempImage = null;
             document.getElementById('edit-mode-label').classList.add('hidden');
             document.getElementById('btn-cancel-edit').classList.add('hidden');
+            document.getElementById('btn-delete-record').classList.add('hidden'); 
             document.getElementById('btn-submit').innerText = "儲存";
             document.getElementById('btn-submit').classList.remove('bg-green-600', 'hover:bg-green-700');
             document.getElementById('btn-submit').classList.add('bg-blue-600');
@@ -280,6 +470,95 @@
             window.recalc();
         };
 
+        // 🟢 品項管理與對照表
+        window.openMappingModal = () => {
+            document.getElementById('mapping-modal').classList.remove('hidden');
+            renderMappingList();
+        };
+
+        // 🟢 修改：增加 Loading 狀態
+        window.addMapping = async () => {
+            const alias = document.getElementById('mapping-alias').value.trim();
+            const standard = document.getElementById('mapping-standard').value.trim();
+            
+            if(!alias || !standard) return showToast("請輸入完整資訊", "error");
+
+            const btn = document.getElementById('btn-add-mapping');
+            const originalText = btn.innerText;
+            btn.innerText = "⏳";
+            btn.disabled = true;
+
+            try {
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'item_mappings'), {
+                    alias: alias,
+                    standardName: standard
+                });
+                document.getElementById('mapping-alias').value = "";
+                document.getElementById('mapping-standard').value = "";
+                showToast("✅ 已同步至雲端");
+            } catch(e) {
+                showToast("新增失敗", "error");
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        };
+
+        window.deleteMapping = async (id) => {
+            if(confirm("確定刪除此規則？")) {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'item_mappings', id));
+                showToast("已刪除");
+            }
+        };
+
+        window.renderMappingList = () => {
+            const tbody = document.getElementById('mapping-tbody');
+            tbody.innerHTML = itemMappings.map(m => `
+                <tr class="border-b">
+                    <td class="p-2 text-gray-600">${m.alias}</td>
+                    <td class="p-2 font-bold text-blue-600">➜</td>
+                    <td class="p-2 font-bold text-gray-800">${m.standardName}</td>
+                    <td class="p-2 text-right">
+                        <button onclick="window.deleteMapping('${m.id}')" class="text-red-400 hover:text-red-600 font-bold">✕</button>
+                    </td>
+                </tr>
+            `).join('');
+        };
+
+        // 🟢 刪除確認按鈕
+        window.deleteCurrentRecord = () => {
+            if (currentEditId) {
+                pendingDeleteId = currentEditId;
+                document.getElementById('delete-modal').classList.remove('hidden');
+            }
+        };
+
+        window.performDelete = async () => {
+            if (!pendingDeleteId) return;
+            
+            const loadingOverlay = document.getElementById('loading-overlay');
+            loadingOverlay.querySelector('p').innerText = "🗑️ 正在刪除...";
+            loadingOverlay.classList.remove('hidden');
+            document.getElementById('delete-modal').classList.add('hidden');
+
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', pendingDeleteId));
+                showToast("✅ 已刪除");
+                window.resetEditor(); 
+            } catch (e) {
+                console.error("Delete failed", e);
+                showToast("❌ 刪除失敗：" + e.message, "error");
+            } finally {
+                loadingOverlay.classList.add('hidden');
+                pendingDeleteId = null;
+            }
+        };
+
+        window.confirmDelete = (id) => {
+            pendingDeleteId = id;
+            document.getElementById('delete-modal').classList.remove('hidden');
+        };
+
         window.editRecord = (id) => {
             const r = records.find(rec => rec.id === id);
             if (!r) return;
@@ -287,7 +566,10 @@
             currentEditId = id; 
             document.getElementById('edit-mode-label').classList.remove('hidden');
             document.getElementById('edit-mode-label').innerText = `正在修改舊資料`;
+            
             document.getElementById('btn-cancel-edit').classList.remove('hidden');
+            document.getElementById('btn-delete-record').classList.remove('hidden');
+            
             document.getElementById('btn-submit').innerText = "確認修改";
             document.getElementById('btn-submit').classList.remove('bg-blue-600');
             document.getElementById('btn-submit').classList.add('bg-green-600', 'hover:bg-green-700');
@@ -295,15 +577,14 @@
             window.tempImage = r.imageBase64;
             document.getElementById('edit-revenue').value = r.revenue;
             
-            if(r.date) {
-                document.getElementById('edit-date').value = r.date.split('T')[0];
-            }
-
+            if(r.date) document.getElementById('edit-date').value = r.date.split('T')[0];
             document.getElementById('diary-market').value = r.market;
             document.getElementById('diary-mood').value = r.mood;
+            
             const tbody = document.getElementById('edit-items-body');
             tbody.innerHTML = '';
-            r.items.forEach(i => window.addItemRow(i.name, i.qty, i.unitPrice, i.cost));
+            r.items.forEach(i => window.addItemRow(i.name, i.qty, i.unitPrice, i.note || ""));
+            
             document.getElementById('img-preview').src = r.imageBase64 || "";
             document.getElementById('preview-box').classList.toggle('hidden', !r.imageBase64);
             document.getElementById('upload-placeholder').classList.toggle('hidden', !!r.imageBase64);
@@ -319,7 +600,7 @@
             
             document.getElementById('view-date').innerText = dateStr;
             document.getElementById('view-revenue').innerText = r.revenue.toLocaleString();
-            document.getElementById('view-profit').innerText = r.profit.toLocaleString();
+            document.getElementById('view-profit').innerText = (r.profit || 0).toLocaleString();
             
             document.getElementById('view-market').innerText = r.market || "未記錄";
             document.getElementById('view-mood').innerText = r.mood || "未記錄";
@@ -327,36 +608,80 @@
             document.getElementById('view-image').src = r.imageBase64 || "";
             document.getElementById('view-image').classList.toggle('hidden', !r.imageBase64);
             document.getElementById('view-no-image').classList.toggle('hidden', !!r.imageBase64);
-            document.getElementById('view-items-tbody').innerHTML = r.items.map(i => `<tr class="border-b border-gray-50"><td class="py-2 text-xs font-bold">${i.name}</td><td class="py-2 text-center text-xs text-gray-400">${i.unitPrice?.toLocaleString() || 0} x ${i.qty}</td><td class="py-2 text-right font-medium text-xs sm:text-sm">${i.cost.toLocaleString()}</td></tr>`).join('');
+            
+            document.getElementById('view-items-tbody').innerHTML = r.items.map(i => {
+                const noteHtml = i.note ? `<div class="text-[10px] text-purple-600 mt-1">💬 ${i.note}</div>` : '';
+                return `
+                <tr class="border-b border-gray-50">
+                    <td class="py-2 text-xs font-bold">${i.name} ${noteHtml}</td>
+                    <td class="py-2 text-center text-xs text-gray-400">${i.unitPrice?.toLocaleString() || 0} x ${i.qty}</td>
+                    <td class="py-2 text-right font-medium text-xs sm:text-sm text-gray-500">${(i.cost || 0).toLocaleString()}</td>
+                </tr>`;
+            }).join('');
             document.getElementById('detail-modal').classList.remove('hidden');
         };
 
         window.downloadExcel = () => {
             const filterVal = document.getElementById('report-filter').value;
+            const filterSelect = document.getElementById('report-filter');
+            const selectedText = filterSelect.options[filterSelect.selectedIndex].text.replace('📅 ', '').replace('🗓️ ', '').replace(' (全年)', '');
+            
             let exportData = records;
-            if (filterVal !== 'all') {
-                exportData = records.filter(r => r.date.startsWith(filterVal));
-            }
-            if (!exportData.length) return alert("目前篩選範圍無資料");
+            if (filterVal !== 'all') exportData = records.filter(r => r.date.startsWith(filterVal));
+            if (!exportData.length) return showToast("目前篩選範圍無資料", "error");
             
             const ws = XLSX.utils.json_to_sheet(exportData.map(r => ({ 
                 "日期": r.date.split('T')[0], 
                 "營業額": r.revenue, 
-                "成本": r.totalCost,
-                "淨利": r.profit, 
-                "分潤": r.split,
-                "心情": r.mood
+                "總成本": r.totalCost || 0, 
+                "淨利": r.profit || 0, 
+                "分潤": r.split, 
+                "心情": r.mood,
+                "品項備註": r.items.map(i => i.note ? `${i.name}:${i.note}` : '').filter(Boolean).join('; ')
             })));
-            const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "報表"); 
-            XLSX.writeFile(wb, `營運報表_${filterVal === 'all' ? '全部' : filterVal}.xlsx`);
+            const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "營運報表"); 
+            XLSX.writeFile(wb, `營運報表_${selectedText}.xlsx`);
+        };
+
+        window.downloadStatsExcel = () => {
+            const filterVal = document.getElementById('stats-filter').value;
+            const filterSelect = document.getElementById('stats-filter');
+            const selectedText = filterSelect.options[filterSelect.selectedIndex].text.replace('📅 ', '').replace('🗓️ ', '').replace(' (全年)', '');
+
+            let displayRecords = records;
+            if (filterVal !== 'all') displayRecords = records.filter(r => r.date.startsWith(filterVal));
+            if (!displayRecords.length) return showToast("目前篩選範圍無資料", "error");
+
+            const itemStats = {};
+            displayRecords.forEach(r => {
+                r.items.forEach(i => {
+                    const name = i.name;
+                    if (!itemStats[name]) itemStats[name] = { qty: 0, cost: 0, notes: [] };
+                    itemStats[name].qty += (i.qty || 0);
+                    itemStats[name].cost += (i.cost || 0);
+                    if(i.note) itemStats[name].notes.push(i.note);
+                });
+            });
+
+            const sortedItems = Object.keys(itemStats).map(key => ({
+                "品項名稱": key, 
+                "總採購數量": itemStats[key].qty, 
+                "總採購成本": itemStats[key].cost,
+                "備註摘要": itemStats[key].notes.slice(0, 5).join('; ') 
+            })).sort((a, b) => b["總採購成本"] - a["總採購成本"]);
+
+            const ws = XLSX.utils.json_to_sheet(sortedItems);
+            const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "成本統計"); 
+            XLSX.writeFile(wb, `成本統計報表_${selectedText}.xlsx`);
         };
 
         window.switchTab = (tab) => {
             document.getElementById('page-record').classList.toggle('hidden', tab !== 'record');
             document.getElementById('page-report').classList.toggle('hidden', tab !== 'report');
             document.getElementById('page-stats').classList.toggle('hidden', tab !== 'stats');
+            document.getElementById('page-ai').classList.toggle('hidden', tab !== 'ai'); 
 
-            ['record', 'report', 'stats'].forEach(t => {
+            ['record', 'report', 'stats', 'ai'].forEach(t => {
                 const btn = document.getElementById(`btn-tab-${t}`);
                 if (t === tab) {
                     btn.className = 'flex-1 py-3 text-center bg-blue-600 text-white rounded-xl shadow font-bold transition text-xs sm:text-base';
@@ -370,123 +695,89 @@
         };
 
         function updateFilterOptions() {
-            const yearSet = new Set();
-            const monthSet = new Set();
-            
+            const yearSet = new Set(), monthSet = new Set();
             records.forEach(r => {
                 let dateStr = r.date;
                 if(dateStr.includes('T')) dateStr = dateStr.split('T')[0];
                 const parts = dateStr.split('-');
-                if(parts.length >= 2) {
-                    yearSet.add(parts[0]); 
-                    monthSet.add(`${parts[0]}-${parts[1]}`); 
-                }
+                if(parts.length >= 2) { yearSet.add(parts[0]); monthSet.add(`${parts[0]}-${parts[1]}`); }
             });
-            
             const sortedYears = Array.from(yearSet).sort().reverse();
             const sortedMonths = Array.from(monthSet).sort().reverse();
             
             let optionsHtml = '<option value="all">📅 全部期間</option>';
-            
-            sortedYears.forEach(y => {
-                optionsHtml += `<option value="${y}" class="font-bold text-blue-700">🗓️ ${y}年 (全年)</option>`;
-            });
-            
-            sortedMonths.forEach(m => {
-                const [y, mon] = m.split('-');
-                optionsHtml += `<option value="${m}">${y}年 ${mon}月</option>`;
-            });
+            sortedYears.forEach(y => { optionsHtml += `<option value="${y}" class="font-bold text-blue-700">🗓️ ${y}年 (全年)</option>`; });
+            sortedMonths.forEach(m => { const [y, mon] = m.split('-'); optionsHtml += `<option value="${m}">${y}年 ${mon}月</option>`; });
 
-            const reportFilter = document.getElementById('report-filter');
-            const statsFilter = document.getElementById('stats-filter');
-            
-            if (reportFilter && reportFilter.innerHTML !== optionsHtml) reportFilter.innerHTML = optionsHtml;
-            if (statsFilter && statsFilter.innerHTML !== optionsHtml) statsFilter.innerHTML = optionsHtml;
+            const filters = ['report-filter', 'stats-filter', 'ai-filter'];
+            filters.forEach(id => {
+                const el = document.getElementById(id);
+                if(el && el.innerHTML !== optionsHtml) el.innerHTML = optionsHtml;
+            });
         }
 
         window.renderReport = () => {
             const filterVal = document.getElementById('report-filter').value;
+            const filterSelect = document.getElementById('report-filter');
+            const selectedText = filterSelect.options[filterSelect.selectedIndex].text.replace('📅 ', '').replace('🗓️ ', '').replace(' (全年)', '');
             const tbody = document.getElementById('report-tbody');
             if (!tbody) return;
             tbody.innerHTML = '';
             
             let displayRecords = records;
-            if (filterVal !== 'all') {
-                displayRecords = records.filter(r => r.date.startsWith(filterVal));
-            }
+            if (filterVal !== 'all') displayRecords = records.filter(r => r.date.startsWith(filterVal));
             
-            let totalSplit = 0;
-            let totalRevenue = 0;
-            let totalProfit = 0;
-            const itemTotals = {};
+            let totalSplit = 0, totalRevenue = 0, totalProfit = 0;
+            const itemTotals = {}; 
 
             if (displayRecords.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="5" class="p-10 text-center text-gray-300">該期間無資料</td></tr>';
             } else {
                 displayRecords.forEach(r => {
-                    totalSplit += r.split || 0;
-                    totalRevenue += r.revenue || 0;
-                    totalProfit += r.profit || 0;
-                    r.items.forEach(i => itemTotals[i.name] = (itemTotals[i.name] || 0) + i.cost);
-                    
+                    totalSplit += r.split || 0; totalRevenue += r.revenue || 0; totalProfit += (r.profit || 0);
+                    r.items.forEach(i => itemTotals[i.name] = (itemTotals[i.name] || 0) + (i.cost || 0));
                     const dateDisplay = r.date.includes('T') ? new Date(r.date).toLocaleDateString() : r.date;
-
                     const tr = document.createElement('tr');
                     tr.className = "border-b hover:bg-gray-50";
                     tr.innerHTML = `
-                        <td class="py-3 px-2">
-                            <div class="font-bold text-gray-800 text-xs sm:text-base">${dateDisplay}</div>
-                            <div class="flex gap-2 mt-1">
-                                <button onclick="window.viewRecordDetails('${r.id}')" class="text-[10px] text-green-600 font-bold">詳情</button>
-                                <button onclick="window.editRecord('${r.id}')" class="text-[10px] text-blue-500 font-bold">修改</button>
-                                <button onclick="window.confirmDelete('${r.id}')" class="text-[10px] text-red-400 font-bold">刪除</button>
-                            </div>
-                        </td>
+                        <td class="py-3 px-2"><div class="font-bold text-gray-800 text-xs sm:text-base">${dateDisplay}</div><div class="flex gap-2 mt-1"><button onclick="window.viewRecordDetails('${r.id}')" class="text-[10px] text-green-600 font-bold">詳情</button><button onclick="window.editRecord('${r.id}')" class="text-[10px] text-blue-500 font-bold">修改</button><button onclick="window.confirmDelete('${r.id}')" class="text-[10px] text-red-400 font-bold">刪除</button></div></td>
                         <td class="py-3 px-2 text-right text-xs sm:text-sm">${r.revenue.toLocaleString()}</td>
-                        <td class="py-3 px-2 text-right text-gray-400 text-xs sm:text-sm">${r.totalCost.toLocaleString()}</td>
+                        <td class="py-3 px-2 text-right text-gray-400 text-xs sm:text-sm">${(r.totalCost || 0).toLocaleString()}</td>
                         <td class="py-3 px-2 text-right font-bold text-green-600 text-xs sm:text-sm">${(r.profit || 0).toLocaleString()}</td>
-                        <td class="py-3 px-2 text-right font-bold text-orange-600 text-xs sm:text-sm">${(r.split || 0).toLocaleString()}</td>
-                    `;
+                        <td class="py-3 px-2 text-right font-bold text-orange-600 text-xs sm:text-sm">${(r.split || 0).toLocaleString()}</td>`;
                     tbody.appendChild(tr);
                 });
             }
-            
             document.getElementById('stat-total-split').innerText = Math.max(0, totalSplit).toLocaleString();
             document.getElementById('stat-total-revenue').innerText = totalRevenue.toLocaleString();
             document.getElementById('stat-total-profit').innerText = totalProfit.toLocaleString();
-            
+            const labelEl = document.getElementById('stat-split-label');
+            if(labelEl) labelEl.innerText = filterVal === 'all' ? "累積總分潤 (50%)" : `${selectedText} 分潤 (50%)`;
             updateChart(itemTotals);
         };
 
         window.renderItemStats = () => {
             const filterVal = document.getElementById('stats-filter').value;
             const tbody = document.getElementById('stats-tbody');
+            const tbodyRanking = document.getElementById('profit-ranking-tbody'); 
             if (!tbody) return;
             tbody.innerHTML = '';
+            tbodyRanking.innerHTML = '';
 
             let displayRecords = records;
-            if (filterVal !== 'all') {
-                displayRecords = records.filter(r => r.date.startsWith(filterVal));
-            }
+            if (filterVal !== 'all') displayRecords = records.filter(r => r.date.startsWith(filterVal));
 
-            let totalPeriodRevenue = 0;
-            let totalPeriodCost = 0;
-            let totalPeriodProfit = 0;
-            let totalPeriodQty = 0;
-
+            let totalPeriodRevenue = 0, totalPeriodCost = 0, totalPeriodProfit = 0, totalPeriodQty = 0;
             const itemStats = {};
             displayRecords.forEach(r => {
                 totalPeriodRevenue += (r.revenue || 0);
                 totalPeriodCost += (r.totalCost || 0);
                 totalPeriodProfit += (r.profit || 0);
-
                 r.items.forEach(i => {
                     const name = i.name;
-                    if (!itemStats[name]) {
-                        itemStats[name] = { qty: 0, revenue: 0 };
-                    }
+                    if (!itemStats[name]) itemStats[name] = { qty: 0, cost: 0 };
                     itemStats[name].qty += (i.qty || 0);
-                    itemStats[name].revenue += (i.cost || 0);
+                    itemStats[name].cost += (i.cost || 0); // 這裡是成本
                     totalPeriodQty += (i.qty || 0);
                 });
             });
@@ -496,25 +787,46 @@
             document.getElementById('card-profit').innerText = `$${totalPeriodProfit.toLocaleString()}`;
             document.getElementById('card-qty').innerText = `${totalPeriodQty.toLocaleString()}`;
 
+            // 成本排行
             const sortedItems = Object.keys(itemStats).map(key => ({
-                name: key,
-                ...itemStats[key]
-            })).sort((a, b) => b.qty - a.qty);
+                name: key, ...itemStats[key],
+                percent: totalPeriodCost > 0 ? (itemStats[key].cost / totalPeriodCost * 100).toFixed(1) : 0
+            })).sort((a, b) => b.cost - a.cost); // 依成本金額排序
 
             if (sortedItems.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" class="p-10 text-center text-gray-300">該期間無銷售資料</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" class="p-10 text-center text-gray-300">該期間無資料</td></tr>';
             } else {
                 sortedItems.forEach((item, index) => {
                     const tr = document.createElement('tr');
                     tr.className = "border-b hover:bg-gray-50";
                     const rank = index < 3 ? ['🥇', '🥈', '🥉'][index] : (index + 1);
                     tr.innerHTML = `
-                        <td class="py-4 px-4 font-black text-lg text-gray-700 w-16 text-center">${rank}</td>
+                        <td class="py-4 px-2 font-black text-lg text-gray-700 w-12 text-center">${rank}</td>
                         <td class="py-4 px-2 font-bold text-blue-800 text-sm sm:text-base">${item.name}</td>
                         <td class="py-4 px-2 text-center font-bold text-gray-600 bg-gray-50 rounded-lg">${item.qty}</td>
-                        <td class="py-4 px-2 text-right font-bold text-green-600">$${item.revenue.toLocaleString()}</td>
+                        <td class="py-4 px-2 text-right font-bold text-gray-600">$${item.cost.toLocaleString()}</td>
+                        <td class="py-4 px-2 text-right text-xs text-gray-400">${item.percent}%</td>
                     `;
                     tbody.appendChild(tr);
+                });
+            }
+
+            // 每日獲利王 (依淨利排序)
+            const sortedProfits = [...displayRecords].sort((a, b) => b.profit - a.profit).slice(0, 10);
+            if (sortedProfits.length === 0) {
+                tbodyRanking.innerHTML = '<tr><td colspan="3" class="p-5 text-center text-gray-300">無資料</td></tr>';
+            } else {
+                sortedProfits.forEach((r, index) => {
+                    const tr = document.createElement('tr');
+                    tr.className = "border-b hover:bg-gray-50";
+                    const rank = index < 3 ? ['🥇', '🥈', '🥉'][index] : (index + 1);
+                    const dateDisplay = r.date.includes('T') ? r.date.split('T')[0] : r.date;
+                    tr.innerHTML = `
+                        <td class="py-3 px-4 font-black text-gray-700 text-center">${rank}</td>
+                        <td class="py-3 px-2 font-bold text-gray-800">${dateDisplay}</td>
+                        <td class="py-3 px-4 text-right font-black text-green-600">$${(r.profit || 0).toLocaleString()}</td>
+                    `;
+                    tbodyRanking.appendChild(tr);
                 });
             }
         };
@@ -528,59 +840,121 @@
             itemChart = new Chart(ctx, { type: 'doughnut', data: { labels: labels, datasets: [{ data: Object.values(stats), backgroundColor: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#6366f1'] }] }, options: { responsive: true, maintainAspectRatio: false } });
         }
         
-        // Settings Modal Logic
         window.openSettings = () => {
             document.getElementById('settings-modal').classList.remove('hidden');
             document.getElementById('api-key-input').value = myApiKey;
         };
 
-        window.saveSettings = () => {
+        window.saveSettings = async () => {
             const newKey = document.getElementById('api-key-input').value.trim();
-            if(!newKey) return alert("請輸入有效的 API Key");
-            
+            if(!newKey) return showToast("請輸入有效的 API Key", "error");
             localStorage.setItem('user_gemini_api_key', newKey);
             myApiKey = newKey;
+            if (currentUser) {
+                try {
+                    const configRef = doc(db, 'artifacts', appId, 'public', 'data', 'config', 'main');
+                    await setDoc(configRef, { gemini_api_key: newKey }, { merge: true });
+                    showToast("✅ 設定已儲存並同步至雲端！");
+                } catch (e) { showToast("✅ 設定已儲存於本地"); }
+            } else { showToast("✅ 設定已儲存於本地"); }
             document.getElementById('settings-modal').classList.add('hidden');
-            alert("✅ 設定已儲存！");
         };
 
-        window.confirmDelete = (id) => { if(confirm("確定刪除？")) deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', id)); };
+        // 🟢 通用提示 Toast
+        function showToast(message, type = "success") {
+            const toast = document.createElement("div");
+            toast.className = `fixed bottom-4 left-1/2 transform -translate-x-1/2 px-6 py-3 rounded-xl shadow-2xl z-50 text-white font-bold transition-all duration-300 animate-in slide-in-from-bottom-5 ${type === "error" ? "bg-red-600" : "bg-gray-800"}`;
+            toast.innerText = message;
+            document.body.appendChild(toast);
+            setTimeout(() => {
+                toast.classList.add("opacity-0");
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
 
-        window.addEventListener('load', () => {
-            document.getElementById('nav-date').innerText = new Date().toLocaleDateString('zh-TW', { month: 'long', day: 'numeric', weekday: 'long' });
-            document.getElementById('edit-date').value = new Date().toISOString().split('T')[0];
-        });
     </script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
         body { font-family: 'Noto Sans TC', sans-serif; background-color: #f8fafc; }
         .chart-container { position: relative; height: 240px; width: 100%; }
         input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        .prose h3 { font-size: 1.25rem; font-weight: 700; margin-top: 1rem; margin-bottom: 0.5rem; color: #1e3a8a; }
+        .prose ul { list-style-type: disc; padding-left: 1.5rem; margin-bottom: 1rem; }
+        .prose li { margin-bottom: 0.25rem; }
+        .prose strong { color: #0f172a; }
     </style>
 </head>
 <body class="min-h-screen pb-10">
+    <!-- 初始載入動畫 -->
+    <div id="initial-loader" class="fixed inset-0 bg-white z-[60] flex items-center justify-center flex-col hidden">
+        <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mb-4"></div>
+        <p class="text-gray-500 font-bold">正在讀取資料庫...</p>
+    </div>
+
+    <!-- 刪除確認 Modal -->
+    <div id="delete-modal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 hidden">
+        <div class="bg-white w-full max-w-sm rounded-3xl shadow-2xl p-6 text-center space-y-4 animate-in zoom-in-95 duration-200">
+            <div class="text-5xl">🗑️</div>
+            <h3 class="text-xl font-bold text-gray-800">確定要刪除嗎？</h3>
+            <p class="text-gray-500 text-sm">此動作無法復原，請確認您要刪除這筆紀錄。</p>
+            <div class="flex gap-3 pt-2">
+                <button onclick="document.getElementById('delete-modal').classList.add('hidden'); pendingDeleteId = null;" class="flex-1 bg-gray-100 text-gray-600 py-3 rounded-xl font-bold hover:bg-gray-200">取消</button>
+                <button onclick="window.performDelete()" class="flex-1 bg-red-500 text-white py-3 rounded-xl font-bold shadow-lg hover:bg-red-600">確認刪除</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 品項對照表 Modal -->
+    <div id="mapping-modal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 hidden">
+        <div class="bg-white w-full max-w-lg rounded-3xl shadow-2xl p-6 space-y-4 animate-in zoom-in-95 duration-200 h-[80vh] flex flex-col">
+            <div class="flex justify-between items-center border-b pb-4">
+                <h3 class="text-xl font-bold text-gray-800 flex items-center gap-2">📦 品項名稱管理</h3>
+                <button onclick="document.getElementById('mapping-modal').classList.add('hidden')" class="text-gray-400 hover:text-gray-800 text-2xl">✕</button>
+            </div>
+            
+            <div class="flex gap-2">
+                <input type="text" id="mapping-alias" placeholder="輸入別名 (如: apple)" class="flex-1 border rounded-xl p-3 text-sm">
+                <span class="self-center">➜</span>
+                <input type="text" id="mapping-standard" placeholder="對應標準名 (如: 蘋果)" class="flex-1 border rounded-xl p-3 text-sm">
+                <button id="btn-add-mapping" onclick="window.addMapping()" class="bg-blue-600 text-white px-4 rounded-xl font-bold shadow hover:bg-blue-700">＋</button>
+            </div>
+            
+            <div class="flex-1 overflow-y-auto">
+                <table class="w-full text-sm">
+                    <thead class="bg-gray-50 text-gray-500 sticky top-0">
+                        <tr><th class="p-2 text-left">別名</th><th class="p-2"></th><th class="p-2 text-left">標準名稱</th><th class="p-2"></th></tr>
+                    </thead>
+                    <tbody id="mapping-tbody" class="divide-y"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
     <nav class="bg-blue-700 text-white p-4 shadow-lg sticky top-0 z-40 flex justify-between items-center">
         <div class="flex items-center gap-2">
             <h1 class="text-xl font-bold">📊 營運助理</h1>
-            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">安全版 v7.3</div>
+            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">雲端同步旗艦版 v9.7</div>
         </div>
         <div class="flex items-center gap-3">
-            <span id="nav-date" class="text-xs opacity-80 hidden sm:inline"></span>
+            <button onclick="window.openMappingModal()" class="bg-blue-800 p-2 rounded-full hover:bg-blue-600 transition shadow-inner" title="管理品項名稱">
+                <span class="relative">📦<span class="absolute -top-1 -right-1 text-[8px] bg-green-400 rounded-full w-2 h-2"></span></span>
+            </button>
             <button onclick="window.openSettings()" class="bg-blue-800 p-2 rounded-full hover:bg-blue-600 transition shadow-inner" title="設定 API Key">⚙️</button>
         </div>
     </nav>
 
     <main class="max-w-4xl mx-auto p-4 space-y-6">
-        <div class="flex bg-white p-1 rounded-2xl shadow-sm border">
-            <button id="btn-tab-record" onclick="switchTab('record')" class="flex-1 py-3 text-center bg-blue-600 text-white rounded-xl font-bold transition text-xs sm:text-base">掃描記帳</button>
-            <button id="btn-tab-report" onclick="switchTab('report')" class="flex-1 py-3 text-center text-gray-500 font-bold transition text-xs sm:text-base">營運報表</button>
-            <button id="btn-tab-stats" onclick="switchTab('stats')" class="flex-1 py-3 text-center text-gray-500 font-bold transition text-xs sm:text-base">品項統計</button>
+        <div class="flex bg-white p-1 rounded-2xl shadow-sm border overflow-x-auto">
+            <button id="btn-tab-record" onclick="switchTab('record')" class="flex-1 py-3 min-w-[80px] text-center bg-blue-600 text-white rounded-xl font-bold transition text-xs sm:text-base whitespace-nowrap">掃描記帳</button>
+            <button id="btn-tab-report" onclick="switchTab('report')" class="flex-1 py-3 min-w-[80px] text-center text-gray-500 font-bold transition text-xs sm:text-base whitespace-nowrap">營運報表</button>
+            <button id="btn-tab-stats" onclick="switchTab('stats')" class="flex-1 py-3 min-w-[80px] text-center text-gray-500 font-bold transition text-xs sm:text-base whitespace-nowrap">成本分析</button>
+            <button id="btn-tab-ai" onclick="switchTab('ai')" class="flex-1 py-3 min-w-[80px] text-center text-gray-500 font-bold transition text-xs sm:text-base whitespace-nowrap">AI 診斷</button>
         </div>
         
         <!-- 頁面 1: 掃描記帳 -->
         <section id="page-record" class="space-y-4">
             <div class="bg-white p-10 rounded-3xl shadow-sm border-2 border-dashed border-blue-200 text-center cursor-pointer hover:bg-blue-50 transition" onclick="document.getElementById('fileInput').click()">
-                <div id="upload-placeholder"><div class="text-6xl mb-4">📸</div><p class="text-xl font-bold text-gray-700">拍攝記帳</p><p class="text-sm text-gray-400">AI 正在幫你辨識左下角日期、單價與金額...</p></div>
+                <div id="upload-placeholder"><div class="text-6xl mb-4">📸</div><p class="text-xl font-bold text-gray-700">拍攝記帳</p><p class="text-sm text-gray-400">AI 正在幫你辨識日期、總營收與進貨成本...</p></div>
                 <div id="preview-box" class="hidden"><img id="img-preview" class="max-h-72 mx-auto rounded-2xl shadow-lg mb-4"></div>
                 <input type="file" id="fileInput" class="hidden" accept="image/*" onchange="handleFileUpload(event)">
             </div>
@@ -588,7 +962,7 @@
             <div id="loading-overlay" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center text-white text-center">
                 <div class="bg-white/10 backdrop-blur-md p-10 rounded-3xl shadow-2xl">
                     <div class="inline-block animate-spin text-5xl mb-4">🧠</div>
-                    <p class="text-xl font-bold">AI 正在搜尋「日期:」與金額...</p>
+                    <p class="text-xl font-bold">AI 正在運作中...</p>
                 </div>
             </div>
 
@@ -601,27 +975,30 @@
                 </div>
 
                 <div class="bg-blue-50 p-5 rounded-2xl border border-blue-100">
-                    <label class="block text-sm font-bold text-blue-800">今日總營業額</label>
+                    <label class="block text-sm font-bold text-blue-800">今日總營業額 (手動/AI填寫)</label>
                     <input type="number" id="edit-revenue" class="w-full text-4xl font-black bg-transparent border-b-2 border-blue-200 focus:border-blue-500 outline-none transition" oninput="window.recalc()">
                 </div>
+
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-sm">
                         <thead class="text-gray-400 border-b">
                             <tr>
-                                <th class="pb-3">品項名稱</th>
-                                <th class="pb-3 w-16 text-center">數量</th>
-                                <th class="pb-3 w-24 text-right">單價</th>
-                                <th class="pb-3 w-24 text-right">總計</th>
-                                <th class="pb-3 w-10"></th>
+                                <th class="pb-3 min-w-[100px]">品項名稱(進貨)</th>
+                                <th class="pb-3 w-14 text-center">數量</th>
+                                <th class="pb-3 w-16 text-right">單價</th>
+                                <th class="pb-3 w-16 text-right">小計</th>
+                                <th class="pb-3 min-w-[100px]">備註</th>
+                                <th class="pb-3 w-8"></th>
                             </tr>
                         </thead>
                         <tbody id="edit-items-body" class="divide-y divide-gray-50"></tbody>
                     </table>
                 </div>
                 <button onclick="window.addItemRow()" class="text-blue-600 font-bold text-sm hover:bg-blue-50 px-4 py-2 rounded-lg">+ 新增品項</button>
+                
                 <div class="grid grid-cols-3 gap-3 pt-6 border-t text-center">
-                    <div class="bg-gray-100 p-4 rounded-2xl"><p class="text-[10px] text-gray-400">總成本</p><p id="calc-cost" class="font-black text-gray-800 text-sm">0</p></div>
-                    <div class="bg-green-100 p-4 rounded-2xl"><p class="text-[10px] text-green-500">利潤</p><p id="calc-profit" class="font-black text-green-700 text-sm">0</p></div>
+                    <div class="bg-gray-100 p-4 rounded-2xl"><p class="text-[10px] text-gray-400">總成本(進貨)</p><p id="calc-cost" class="font-black text-gray-800 text-sm">0</p></div>
+                    <div class="bg-green-100 p-4 rounded-2xl"><p class="text-[10px] text-green-500">本日利潤</p><p id="calc-profit" class="font-black text-green-700 text-sm">0</p></div>
                     <div class="bg-orange-100 p-4 rounded-2xl"><p class="text-[10px] text-orange-500">分潤 (50%)</p><p id="calc-split" class="font-black text-orange-700 text-sm">0</p></div>
                 </div>
                 <div class="space-y-4 pt-4">
@@ -636,8 +1013,8 @@
                 </div>
                 
                 <div class="flex gap-3">
-                    <button id="btn-cancel-edit" onclick="window.resetEditor()" class="hidden flex-1 bg-gray-200 text-gray-600 py-5 rounded-3xl font-bold text-xl shadow hover:bg-gray-300 transition">取消修改</button>
-                    <!-- 按鈕文字已修改為「儲存」 -->
+                    <button id="btn-delete-record" onclick="window.deleteCurrentRecord()" class="hidden flex-1 bg-red-100 text-red-500 py-5 rounded-3xl font-bold text-lg shadow hover:bg-red-200 transition">刪除</button>
+                    <button id="btn-cancel-edit" onclick="window.resetEditor()" class="hidden flex-1 bg-gray-200 text-gray-600 py-5 rounded-3xl font-bold text-lg shadow hover:bg-gray-300 transition">取消</button>
                     <button id="btn-submit" onclick="window.submitRecord()" class="flex-[2] bg-blue-600 text-white py-5 rounded-3xl font-black text-xl shadow-xl hover:scale-[1.01] transition">儲存</button>
                 </div>
             </div>
@@ -654,12 +1031,12 @@
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div class="bg-white p-6 rounded-3xl shadow-sm border">
-                    <h3 class="font-bold text-gray-800 mb-4 flex items-center gap-2 text-sm sm:text-base">📦 支出占比</h3>
+                    <h3 class="font-bold text-gray-800 mb-4 flex items-center gap-2 text-sm sm:text-base">📦 成本占比</h3>
                     <div class="chart-container"><canvas id="itemChart"></canvas></div>
                 </div>
                 <div class="bg-white p-8 rounded-3xl shadow-sm border flex flex-col justify-center space-y-4">
                     <div class="text-center">
-                        <p class="text-gray-400 font-bold text-xs">累積總分潤 (50%)</p>
+                        <p id="stat-split-label" class="text-gray-400 font-bold text-xs">累積總分潤 (50%)</p>
                         <p id="stat-total-split" class="text-4xl font-black text-orange-600">0</p>
                     </div>
                     <div class="grid grid-cols-2 gap-4 pt-4 border-t">
@@ -689,10 +1066,10 @@
             </div>
         </section>
 
-        <!-- 頁面 3: 品項統計 (專業版) -->
+        <!-- 頁面 3: 成本分析 -->
         <section id="page-stats" class="hidden space-y-6">
             <div class="flex justify-between items-center bg-white p-4 rounded-2xl shadow-sm border">
-                <h3 class="font-bold text-gray-800 flex items-center gap-2">🏆 熱銷排行統計</h3>
+                <h3 class="font-bold text-gray-800 flex items-center gap-2">🏆 成本與獲利分析</h3>
                 <select id="stats-filter" onchange="window.renderItemStats()" class="bg-gray-100 border-none text-sm font-bold py-2 px-4 rounded-xl outline-none cursor-pointer hover:bg-gray-200 transition">
                     <option value="all">📅 全部期間</option>
                 </select>
@@ -713,29 +1090,79 @@
                     <p id="card-profit" class="text-2xl font-black text-green-600">$0</p>
                 </div>
                 <div class="bg-white border p-5 rounded-2xl shadow-sm">
-                    <p class="text-xs text-purple-500 font-bold mb-1">銷售總數量</p>
+                    <p class="text-xs text-purple-500 font-bold mb-1">採購總品項數</p>
                     <p id="card-qty" class="text-2xl font-black text-purple-600">0</p>
                 </div>
             </div>
 
-            <!-- 詳細排行榜表格 -->
-            <div class="bg-white rounded-3xl shadow-sm border overflow-hidden">
-                <div class="p-5 border-b bg-gray-50">
-                    <h3 class="font-bold text-gray-800">📋 詳細銷售排行</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- 成本排行 -->
+                <div class="bg-white rounded-3xl shadow-sm border overflow-hidden">
+                    <div class="p-5 border-b bg-gray-50 flex justify-between items-center">
+                        <h3 class="font-bold text-gray-800">💰 品項成本排行 (花費最多)</h3>
+                        <button onclick="window.downloadStatsExcel()" class="bg-green-600 text-white text-xs font-bold py-1 px-3 rounded-lg shadow hover:bg-green-700 transition">📥 匯出</button>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left min-w-[300px]">
+                            <thead class="bg-white text-xs text-gray-400 font-bold border-b">
+                                <tr>
+                                    <th class="p-3 w-10 text-center">#</th>
+                                    <th class="p-3">品項</th>
+                                    <th class="p-3 text-center">數量</th>
+                                    <th class="p-3 text-right">總成本</th>
+                                    <th class="p-3 text-right">佔比</th>
+                                </tr>
+                            </thead>
+                            <tbody id="stats-tbody" class="divide-y divide-gray-50 text-sm"></tbody>
+                        </table>
+                    </div>
                 </div>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left min-w-[400px]">
-                        <thead class="bg-white text-xs text-gray-400 font-bold border-b">
-                            <tr>
-                                <th class="p-4 w-16 text-center">排名</th>
-                                <th class="p-4">品項名稱</th>
-                                <th class="p-4 text-center">銷售數量</th>
-                                <th class="p-4 text-right">銷售總金額</th>
-                            </tr>
-                        </thead>
-                        <tbody id="stats-tbody" class="divide-y divide-gray-50 text-sm"></tbody>
-                    </table>
+
+                <!-- 每日獲利王 -->
+                <div class="bg-white rounded-3xl shadow-sm border overflow-hidden">
+                    <div class="p-5 border-b bg-gray-50">
+                        <h3 class="font-bold text-gray-800">📅 每日獲利王 (Top 10)</h3>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left min-w-[300px]">
+                            <thead class="bg-white text-xs text-gray-400 font-bold border-b">
+                                <tr>
+                                    <th class="p-3 w-10 text-center">#</th>
+                                    <th class="p-3">日期</th>
+                                    <th class="p-3 text-right text-green-600">當日淨利</th>
+                                </tr>
+                            </thead>
+                            <tbody id="profit-ranking-tbody" class="divide-y divide-gray-50 text-sm"></tbody>
+                        </table>
+                    </div>
                 </div>
+            </div>
+        </section>
+
+        <!-- 頁面 4: AI 診斷 -->
+        <section id="page-ai" class="hidden space-y-6">
+            <div class="bg-gradient-to-br from-indigo-600 to-purple-700 p-8 rounded-3xl shadow-lg text-white">
+                <h2 class="text-2xl font-bold mb-2">🤖 AI 營運顧問</h2>
+                <p class="opacity-80 mb-6 text-sm">選擇月份，讓 AI 為您分析財務健康狀況並提供改進建議。</p>
+                
+                <div class="flex gap-3">
+                    <select id="ai-filter" class="flex-1 bg-white/90 border border-white/30 text-gray-900 text-sm font-bold py-3 px-4 rounded-xl outline-none cursor-pointer">
+                        <option value="all">📅 全部期間</option>
+                    </select>
+                    <button id="btn-analyze" onclick="window.runAiAnalysis()" class="bg-white text-indigo-700 font-bold py-3 px-6 rounded-xl shadow-lg hover:bg-indigo-50 transition whitespace-nowrap">✨ 開始分析</button>
+                </div>
+            </div>
+
+            <!-- 分析結果顯示區 -->
+            <div id="ai-result-box" class="hidden bg-white p-8 rounded-3xl shadow-sm border border-gray-100 animate-in slide-in-from-bottom-4 duration-700">
+                <div class="flex justify-between items-center mb-6">
+                    <h3 class="text-xl font-bold text-gray-800 flex items-center gap-2">📄 診斷報告</h3>
+                    <div class="flex gap-2">
+                        <button id="btn-save-analysis" onclick="window.saveAiAnalysis()" class="hidden bg-blue-600 text-white text-xs font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition">💾 儲存報告</button>
+                        <button onclick="window.exportAiAnalysis()" class="bg-green-600 text-white text-xs font-bold py-2 px-4 rounded-lg hover:bg-green-700 transition">📥 匯出 Excel</button>
+                    </div>
+                </div>
+                <div id="ai-result-content" class="prose prose-sm sm:prose max-w-none text-gray-600 leading-relaxed"></div>
             </div>
         </section>
     </main>
@@ -747,7 +1174,7 @@
                 <span class="text-2xl">⚙️</span>
                 <h2 class="text-xl font-bold">API 金鑰設定</h2>
             </div>
-            <p class="text-xs text-gray-500">請貼上您的 Google Gemini API Key。金鑰將儲存在您的瀏覽器中。</p>
+            <p class="text-xs text-gray-500">請貼上您的 Google Gemini API Key。金鑰將儲存於雲端，方便跨裝置使用。</p>
             
             <input type="text" id="api-key-input" class="w-full border-2 border-gray-200 rounded-xl p-3 text-sm" placeholder="AIzaSy...">
             
@@ -769,7 +1196,7 @@
                 <div class="bg-green-50 p-5 rounded-2xl"><p class="text-xs text-green-400 font-bold mb-1">本日利潤</p><p id="view-profit" class="text-2xl font-black text-green-700">0</p></div>
             </div>
             <div>
-                <h3 class="text-sm font-bold text-gray-400 mb-3 font-bold italic">📋 採購清單</h3>
+                <h3 class="text-sm font-bold text-gray-400 mb-3 font-bold italic">📋 進貨/成本明細</h3>
                 <table class="w-full text-sm">
                     <thead><tr class="text-gray-400 border-b text-left"><th class="pb-2">品項</th><th class="pb-2 text-center">單價 x 數量</th><th class="pb-2 text-right">小計</th></tr></thead>
                     <tbody id="view-items-tbody" class="divide-y divide-gray-50"></tbody>
