@@ -3,17 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 營運記帳助理 - 家庭共享版</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+    <title>AI 營運記帳助理-雲端版</title>
+    <script src="[https://cdn.tailwindcss.com](https://cdn.tailwindcss.com)"></script>
+    <script src="[https://cdn.jsdelivr.net/npm/chart.js](https://cdn.jsdelivr.net/npm/chart.js)"></script>
+    <script src="[https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js](https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js)"></script>
     <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { initializeApp } from "[https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js](https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js)";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "[https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js](https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js)";
+        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from "[https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js](https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js)";
 
         // ================================================================
-        // 🛠️ 你的 Firebase 設定
+        // 🛠️ 檢查完畢：Firebase 設定正確 (由截圖 image_7e893e 填入)
         // ================================================================
         const firebaseConfig = {
             apiKey: "AIzaSyBWrfJ0OkCIMOJw39_HYq4gjTzPP70LODY",
@@ -25,8 +25,8 @@
             measurementId: "G-XE39NRPN02"
         };
         
-        // 🛠️ Gemini API Key
-        const geminiApiKey = "AIzaSyBW024L7Tkc7sbdBaf-YMpHI_QxR5v3If8"; 
+        // 🛠️ Gemini API Key (已填入你最新的金鑰)
+        const geminiApiKey = "AIzaSyBVSFf07Q_KEXWwrRj2LRL6pdt3wGDuG5c"; 
         // ================================================================
 
         const app = initializeApp(firebaseConfig);
@@ -43,7 +43,8 @@
             try { 
                 await signInAnonymously(auth); 
             } catch (e) { 
-                console.error("Firebase 登入失敗:", e);
+                console.error("Firebase Auth Error:", e);
+                alert("Firebase 登入失敗，請確認 Firebase 設定。");
             }
         };
 
@@ -56,33 +57,24 @@
                     records.sort((a, b) => new Date(b.date) - new Date(a.date));
                     renderReport();
                 }, (err) => {
-                    console.error("Firestore 監聽失敗:", err);
+                    console.error("Database Error:", err);
+                    // 這通常是 Rules 沒設好導致的
                 });
             }
         });
 
         initAuth();
 
-        // 🧠 核心：AI 辨識照片功能
+        // 🧠 強化的 AI 辨識功能：能自動清洗 JSON 標籤
         window.analyzeImage = async (base64Data) => {
-            if (!geminiApiKey) return alert("⚠️ 請填入 Gemini API Key！");
+            if (!geminiApiKey) return alert("⚠️ 請設定 Gemini API Key！");
             
-            // 更詳細的提示詞，引導 AI 準確提取所有資訊
-            const prompt = `你是一個專業的小店會計助手。請仔細分析這張手寫帳本照片，提取以下資訊：
-            1. 日期 (date): 如果照片上有日期（例如 1/29），請轉換為當前年份的 ISO 格式（例如 2026-01-29），若無則不填。
-            2. 今日營業額 (revenue): 帳本上寫的總收入。
-            3. 採購清單 (items): 包含品項名稱(name)、數量(qty)、單價(unitPrice)、該項總額(cost)。
-            
-            請務必遵守：
-            - 如果數量 * 單價 不等於 總額，請以帳本上的總額(cost)為主。
-            - 僅回傳純 JSON 格式，格式範例：
+            const prompt = `你是一個專業會計助理。分析這張手寫帳單照片，提取今日總營業額(revenue)與各品項明細(items)。
+            品項明細需包含：品項名(name)、數量(qty)、單價(unitPrice)、該項小計總額(cost)。
+            請嚴格僅回傳 JSON 格式內容，範例格式：
             {
-                "date": "2026-01-29",
-                "revenue": 38400,
-                "items": [
-                    {"name": "APPLE-日本", "qty": 3, "unitPrice": 1800, "cost": 5400},
-                    {"name": "櫻桃", "qty": 10, "unitPrice": 500, "cost": 5000}
-                ]
+                "revenue": 5000,
+                "items": [{"name": "雞肉", "qty": 10, "unitPrice": 150, "cost": 1500}]
             }`;
             
             const payload = { 
@@ -92,12 +84,9 @@
                         { inlineData: { mimeType: "image/png", data: base64Data.split(',')[1] } }
                     ] 
                 }],
-                generationConfig: {
-                    responseMimeType: "application/json"
-                }
+                generationConfig: { responseMimeType: "application/json" }
             };
             
-            // 使用支援影像辨識的 Flash 模型
             const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`;
             
             try {
@@ -110,14 +99,14 @@
                 const result = await response.json();
                 if (result.error) throw new Error(result.error.message);
                 
-                const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
-                // 移除可能存在的 Markdown 標記
+                let text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                // 清洗 AI 回傳的 Markdown 標記，確保 JSON 可以被正確解析
                 const cleanJson = text.replace(/```json|```/gi, "").trim();
                 return JSON.parse(cleanJson);
 
             } catch (e) { 
-                console.error("AI 辨識發生錯誤:", e);
-                alert("AI 辨識失敗，請檢查網路或 API Key 是否正確。");
+                console.error("AI 辨識詳細錯誤:", e);
+                alert("AI 辨識發生錯誤：" + e.message);
                 return null; 
             }
         };
@@ -131,8 +120,6 @@
                 document.getElementById('img-preview').src = base64;
                 document.getElementById('preview-box').classList.remove('hidden');
                 document.getElementById('upload-placeholder').classList.add('hidden');
-                
-                // 啟動分析狀態
                 document.getElementById('loading-overlay').classList.remove('hidden');
                 
                 try {
@@ -142,8 +129,6 @@
                     } else {
                         fillEditor({ revenue: 0, items: [] }, base64);
                     }
-                } catch (err) {
-                    fillEditor({ revenue: 0, items: [] }, base64);
                 } finally {
                     document.getElementById('loading-overlay').classList.add('hidden');
                 }
@@ -155,33 +140,25 @@
             document.getElementById('edit-revenue').value = data.revenue || 0;
             const tbody = document.getElementById('edit-items-body');
             tbody.innerHTML = '';
-            
             if (data.items && data.items.length > 0) {
                 data.items.forEach(item => window.addItemRow(item.name, item.qty, item.unitPrice, item.cost));
             } else {
                 window.addItemRow();
             }
-            
-            // 如果 AI 辨識到了日期，記錄下來
-            if (data.date) {
-                window.identifiedDate = data.date;
-            } else {
-                window.identifiedDate = null;
-            }
-
             window.tempImage = base64;
             document.getElementById('editor-view').classList.remove('hidden');
             window.recalc();
         }
 
+        // 新增品項行：自動計算 單價 * 數量
         window.addItemRow = (name = '', qty = 1, unitPrice = 0, cost = 0) => {
             const tr = document.createElement('tr');
             tr.className = "border-b border-gray-50";
             tr.innerHTML = `
-                <td class="py-3 px-1"><input type="text" value="${name}" class="w-full border rounded p-2 item-name text-xs sm:text-sm" placeholder="品項"></td>
-                <td class="py-3 px-1"><input type="number" value="${qty}" class="w-full border rounded p-2 item-qty text-center text-xs sm:text-sm" oninput="window.rowUpdate(this)"></td>
-                <td class="py-3 px-1"><input type="number" value="${unitPrice}" class="w-full border rounded p-2 item-uprice text-right text-xs sm:text-sm" oninput="window.rowUpdate(this)"></td>
-                <td class="py-3 px-1"><input type="number" value="${cost}" class="w-full border rounded p-2 item-cost text-right text-xs sm:text-sm bg-gray-50" oninput="window.recalc()"></td>
+                <td class="py-3 px-1"><input type="text" value="${name}" class="w-full border rounded p-2 item-name text-xs sm:text-sm" placeholder="品項名稱"></td>
+                <td class="py-3 px-1"><input type="number" value="${qty}" class="w-full border rounded p-2 item-qty text-center text-xs" oninput="window.rowUpdate(this)"></td>
+                <td class="py-3 px-1"><input type="number" value="${unitPrice}" class="w-full border rounded p-2 item-uprice text-right text-xs" oninput="window.rowUpdate(this)"></td>
+                <td class="py-3 px-1"><input type="number" value="${cost}" class="w-full border rounded p-2 item-cost text-right text-xs bg-gray-50 font-bold" oninput="window.recalc()"></td>
                 <td class="py-3 px-1 text-center"><button onclick="this.parentElement.parentElement.remove(); window.recalc()" class="text-red-400 font-bold">✕</button></td>
             `;
             document.getElementById('edit-items-body').appendChild(tr);
@@ -209,7 +186,7 @@
         };
 
         window.submitRecord = async () => {
-            if (!currentUser) return alert("資料庫尚未就緒...");
+            if (!currentUser) return alert("連線尚未就緒...");
             const rev = parseFloat(document.getElementById('edit-revenue').value) || 0;
             const items = [];
             let totalCost = 0;
@@ -218,37 +195,20 @@
                 const qty = parseInt(tr.querySelector('.item-qty').value) || 0;
                 const uprice = parseFloat(tr.querySelector('.item-uprice').value) || 0;
                 const cost = parseFloat(tr.querySelector('.item-cost').value) || 0;
-                if(name) { 
-                    items.push({ name, qty, unitPrice: uprice, cost }); 
-                    totalCost += cost; 
-                }
+                if(name) { items.push({ name, qty, unitPrice: uprice, cost }); totalCost += cost; }
             });
 
             const record = {
-                revenue: rev,
-                totalCost: totalCost,
-                profit: rev - totalCost,
-                split: (rev - totalCost) * 0.5,
-                items: items,
-                market: document.getElementById('diary-market').value,
-                mood: document.getElementById('diary-mood').value,
-                imageBase64: window.tempImage || "",
-                // 如果 AI 有辨識到日期就用 AI 的，否則用目前的
-                date: currentEditId ? records.find(r=>r.id===currentEditId).date : (window.identifiedDate || new Date().toISOString())
+                revenue: rev, totalCost, profit: rev - totalCost, split: (rev - totalCost) * 0.5,
+                items, market: document.getElementById('diary-market').value, mood: document.getElementById('diary-mood').value,
+                imageBase64: window.tempImage || "", date: currentEditId ? records.find(r=>r.id===currentEditId).date : new Date().toISOString()
             };
 
             try {
-                if (currentEditId) {
-                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', currentEditId), record);
-                    alert("更新成功！");
-                } else {
-                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'records'), record);
-                    alert("儲存成功！");
-                }
-                location.reload();
-            } catch (e) {
-                alert("儲存失敗，請確認 Firebase Rules 設定。");
-            }
+                if (currentEditId) await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', currentEditId), record);
+                else await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'records'), record);
+                alert("儲存成功！"); location.reload();
+            } catch (e) { alert("儲存失敗，請確認 Firebase Rules 是否已發佈。"); }
         };
 
         window.editRecord = (id) => {
@@ -281,13 +241,13 @@
             imgEl.classList.toggle('hidden', !r.imageBase64);
             document.getElementById('view-no-image').classList.toggle('hidden', !!r.imageBase64);
             const itemTbody = document.getElementById('view-items-tbody');
-            itemTbody.innerHTML = r.items.map(i => `<tr class="border-b border-gray-50"><td class="py-2 text-xs sm:text-sm">${i.name}</td><td class="py-2 text-center text-xs text-gray-400">${i.unitPrice?.toLocaleString() || 0} x ${i.qty}</td><td class="py-2 text-right font-medium text-xs sm:text-sm">${i.cost.toLocaleString()}</td></tr>`).join('');
+            itemTbody.innerHTML = r.items.map(i => `<tr class="border-b border-gray-50"><td class="py-2 text-xs font-bold">${i.name}</td><td class="py-2 text-center text-xs text-gray-400">${i.unitPrice?.toLocaleString() || 0} x ${i.qty}</td><td class="py-2 text-right font-medium text-xs sm:text-sm">${i.cost.toLocaleString()}</td></tr>`).join('');
             document.getElementById('detail-modal').classList.remove('hidden');
         };
 
         window.downloadExcel = () => {
-            if (records.length === 0) return alert("尚無資料導出。");
-            const data = records.map(r => ({ "日期": new Date(r.date).toLocaleDateString(), "營業額": r.revenue, "成本": r.totalCost, "利潤": r.profit, "分潤": r.split }));
+            if (records.length === 0) return alert("目前尚無資料可導出。");
+            const data = records.map(r => ({ "日期": new Date(r.date).toLocaleDateString(), "營業額": r.revenue, "總成本": r.totalCost, "淨利": r.profit, "分潤(50%)": r.split }));
             const ws = XLSX.utils.json_to_sheet(data);
             const wb = XLSX.utils.book_new();
             XLSX.utils.book_append_sheet(wb, ws, "報表");
@@ -296,6 +256,7 @@
 
         function renderReport() {
             const tbody = document.getElementById('report-tbody');
+            if (!tbody) return;
             tbody.innerHTML = '';
             let totalSplit = 0;
             const itemTotals = {};
@@ -311,9 +272,9 @@
                         <td class="py-3 px-2">
                             <div class="font-bold text-gray-800 text-xs sm:text-base">${new Date(r.date).toLocaleDateString()}</div>
                             <div class="flex gap-2 mt-1">
-                                <button onclick="window.viewRecordDetails('${r.id}')" class="text-[10px] text-green-600 font-bold hover:underline">🔍 詳情</button>
-                                <button onclick="window.editRecord('${r.id}')" class="text-[10px] text-blue-500 font-bold hover:underline">📝 修改</button>
-                                <button onclick="window.confirmDelete('${r.id}')" class="text-[10px] text-red-400 font-bold">🗑️</button>
+                                <button onclick="window.viewRecordDetails('${r.id}')" class="text-[10px] text-green-600 font-bold">詳情</button>
+                                <button onclick="window.editRecord('${r.id}')" class="text-[10px] text-blue-500 font-bold">修改</button>
+                                <button onclick="window.confirmDelete('${r.id}')" class="text-[10px] text-red-400 font-bold">刪除</button>
                             </div>
                         </td>
                         <td class="py-3 px-2 text-right font-medium text-xs sm:text-sm">${r.revenue.toLocaleString()}</td>
@@ -325,14 +286,13 @@
                 });
             }
             const statEl = document.getElementById('stat-total-split');
-            if(statEl) {
-                statEl.innerText = Math.max(0, totalSplit).toLocaleString();
-            }
+            if(statEl) statEl.innerText = Math.max(0, totalSplit).toLocaleString();
             updateChart(itemTotals);
         }
 
         function updateChart(stats) {
-            const ctx = document.getElementById('itemChart').getContext('2d');
+            const ctx = document.getElementById('itemChart')?.getContext('2d');
+            if (!ctx) return;
             if (itemChart) itemChart.destroy();
             const labels = Object.keys(stats);
             if (labels.length === 0) return;
@@ -344,14 +304,15 @@
             document.getElementById('page-report').classList.toggle('hidden', tab !== 'report');
             document.getElementById('btn-tab-record').className = tab === 'record' ? 'flex-1 py-3 text-center bg-blue-600 text-white rounded-xl shadow font-bold transition' : 'flex-1 py-3 text-center text-gray-500 font-bold transition';
             document.getElementById('btn-tab-report').className = tab === 'report' ? 'flex-1 py-3 text-center bg-blue-600 text-white rounded-xl shadow font-bold transition' : 'flex-1 py-3 text-center text-gray-500 font-bold transition';
+            if(tab === 'report') renderReport();
         };
 
-        window.confirmDelete = (id) => { if(confirm("確定刪除這天的紀錄嗎？")) deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', id)); };
+        window.confirmDelete = (id) => { if(confirm("確定要刪除這天所有的記帳資料嗎？")) deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', id)); };
     </script>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
+        @import url('[https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap](https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap)');
         body { font-family: 'Noto Sans TC', sans-serif; background-color: #f8fafc; }
-        .chart-container { position: relative; height: 220px; width: 100%; }
+        .chart-container { position: relative; height: 240px; width: 100%; }
         input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
     </style>
 </head>
@@ -359,7 +320,7 @@
     <nav class="bg-blue-700 text-white p-4 shadow-lg sticky top-0 z-40 flex justify-between items-center">
         <div class="flex items-center gap-2">
             <h1 class="text-xl font-bold">📊 家庭營運助理</h1>
-            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">雲端同步模式</div>
+            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">雲端連線中</div>
         </div>
         <span id="nav-date" class="text-sm opacity-80"></span>
     </nav>
@@ -372,7 +333,7 @@
         
         <section id="page-record" class="space-y-4">
             <div class="bg-white p-10 rounded-3xl shadow-sm border-2 border-dashed border-blue-200 text-center cursor-pointer hover:bg-blue-50 transition" onclick="document.getElementById('fileInput').click()">
-                <div id="upload-placeholder"><div class="text-6xl mb-4">📸</div><p class="text-xl font-bold text-gray-700">拍攝今日帳本</p><p class="text-sm text-gray-400">AI 掃描字跡並填入數據</p></div>
+                <div id="upload-placeholder"><div class="text-6xl mb-4">📸</div><p class="text-xl font-bold text-gray-700">拍攝今日帳本</p><p class="text-sm text-gray-400">AI 正在幫你辨識單價與金額...</p></div>
                 <div id="preview-box" class="hidden"><img id="img-preview" class="max-h-72 mx-auto rounded-2xl shadow-lg mb-4"></div>
                 <input type="file" id="fileInput" class="hidden" accept="image/*" onchange="handleFileUpload(event)">
             </div>
@@ -380,8 +341,8 @@
             <div id="loading-overlay" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center text-white text-center">
                 <div class="bg-white/10 backdrop-blur-md p-10 rounded-3xl shadow-2xl">
                     <div class="inline-block animate-spin text-5xl mb-4">🧠</div>
-                    <p class="text-xl font-bold">AI 正在分析手寫項目...</p>
-                    <p class="text-sm opacity-70 mt-2">正在辨識單價與數量...</p>
+                    <p class="text-xl font-bold">AI 正在努力分析中...</p>
+                    <p class="text-sm opacity-70 mt-2">辨識字跡需要一點時間...</p>
                 </div>
             </div>
 
@@ -397,7 +358,7 @@
                                 <th class="pb-3">品項名稱</th>
                                 <th class="pb-3 w-16 text-center">數量</th>
                                 <th class="pb-3 w-24 text-right">單價</th>
-                                <th class="pb-3 w-24 text-right">總金額</th>
+                                <th class="pb-3 w-24 text-right">總計</th>
                                 <th class="pb-3 w-10"></th>
                             </tr>
                         </thead>
@@ -406,19 +367,19 @@
                 </div>
                 <button onclick="window.addItemRow()" class="text-blue-600 font-bold text-sm hover:bg-blue-50 px-4 py-2 rounded-lg">+ 新增品項</button>
                 <div class="grid grid-cols-3 gap-3 pt-6 border-t text-center">
-                    <div class="bg-gray-100 p-4 rounded-2xl"><p class="text-[10px] text-gray-400">總成本</p><p id="calc-cost" class="font-black text-gray-800">0</p></div>
-                    <div class="bg-green-100 p-4 rounded-2xl"><p class="text-[10px] text-green-500">利潤</p><p id="calc-profit" class="font-black text-green-700">0</p></div>
-                    <div class="bg-orange-100 p-4 rounded-2xl"><p class="text-[10px] text-orange-500">分潤 (50%)</p><p id="calc-split" class="font-black text-orange-700">0</p></div>
+                    <div class="bg-gray-100 p-4 rounded-2xl"><p class="text-[10px] text-gray-400">總成本</p><p id="calc-cost" class="font-black text-gray-800 text-sm">0</p></div>
+                    <div class="bg-green-100 p-4 rounded-2xl"><p class="text-[10px] text-green-500">本日利潤</p><p id="calc-profit" class="font-black text-green-700 text-sm">0</p></div>
+                    <div class="bg-orange-100 p-4 rounded-2xl"><p class="text-[10px] text-orange-500">分潤 (50%)</p><p id="calc-split" class="font-black text-orange-700 text-sm">0</p></div>
                 </div>
                 <div class="space-y-4 pt-4">
-                    <p class="text-sm font-bold text-gray-400 italic">營運日記</p>
+                    <p class="text-sm font-bold text-gray-400 italic font-bold">營運日記</p>
                     <select id="diary-market" class="w-full border-2 rounded-2xl p-4 bg-gray-50 font-bold outline-none focus:border-blue-400 transition appearance-none">
                         <option>非常好，客人絡繹不絕</option>
                         <option>還不錯，生意穩定</option>
                         <option>一般般，正常發揮</option>
                         <option>比較冷清，明天再努力</option>
                     </select>
-                    <textarea id="diary-mood" rows="3" class="w-full border-2 rounded-2xl p-4 bg-gray-50 outline-none focus:border-blue-400 transition" placeholder="給家人的心情筆記..."></textarea>
+                    <textarea id="diary-mood" rows="3" class="w-full border-2 rounded-2xl p-4 bg-gray-50 outline-none focus:border-blue-400 transition" placeholder="有什麼想記下來的事嗎？..."></textarea>
                 </div>
                 <button onclick="window.submitRecord()" class="w-full bg-blue-600 text-white py-5 rounded-3xl font-black text-xl shadow-xl hover:scale-[1.01] transition">儲存並共享報表</button>
             </div>
@@ -452,15 +413,15 @@
         <div class="bg-white w-full max-w-2xl rounded-[2.5rem] overflow-y-auto max-h-[90vh] shadow-2xl p-8 space-y-8 animate-in zoom-in-95 duration-200">
             <div class="flex justify-between items-center"><h2 id="view-date" class="text-2xl font-black text-blue-700">日期</h2><button onclick="document.getElementById('detail-modal').classList.add('hidden')" class="text-2xl font-bold">✕</button></div>
             <img id="view-image" class="w-full rounded-2xl shadow-lg hidden">
-            <div id="view-no-image" class="bg-gray-100 p-12 rounded-2xl text-center text-gray-400">📸 該紀錄無照片</div>
+            <div id="view-no-image" class="bg-gray-100 p-12 rounded-2xl text-center text-gray-400">📸 該紀錄無存檔照片</div>
             <div class="grid grid-cols-2 gap-4">
                 <div class="bg-blue-50 p-5 rounded-2xl"><p class="text-xs text-blue-400 font-bold mb-1">營業額</p><p id="view-revenue" class="text-2xl font-black text-blue-700">0</p></div>
                 <div class="bg-green-50 p-5 rounded-2xl"><p class="text-xs text-green-400 font-bold mb-1">本日利潤</p><p id="view-profit" class="text-2xl font-black text-green-700">0</p></div>
             </div>
             <div>
-                <h3 class="text-sm font-bold text-gray-400 mb-3">📋 採購明細</h3>
+                <h3 class="text-sm font-bold text-gray-400 mb-3 font-bold italic">📋 採購清單</h3>
                 <table class="w-full text-sm">
-                    <thead><tr class="text-gray-400 border-b text-left"><th class="pb-2">品項</th><th class="pb-2 text-center">單價 x 數量</th><th class="pb-2 text-right">總金額</th></tr></thead>
+                    <thead><tr class="text-gray-400 border-b text-left"><th class="pb-2">品項</th><th class="pb-2 text-center">單價 x 數量</th><th class="pb-2 text-right">小計</th></tr></thead>
                     <tbody id="view-items-tbody" class="divide-y divide-gray-50"></tbody>
                 </table>
             </div>
@@ -468,15 +429,17 @@
                 <div><p class="text-xs text-gray-400 font-bold">📢 買氣狀況</p><p id="view-market" class="font-bold text-gray-800"></p></div>
                 <div><p class="text-xs text-gray-400 font-bold">📝 心情日記</p><p id="view-mood" class="italic text-gray-600 bg-gray-50 p-4 rounded-xl whitespace-pre-wrap"></p></div>
             </div>
-            <button onclick="document.getElementById('detail-modal').classList.add('hidden')" class="w-full bg-gray-900 text-white py-4 rounded-2xl font-bold">關閉詳情</button>
+            <button onclick="document.getElementById('detail-modal').classList.add('hidden')" class="w-full bg-gray-900 text-white py-4 rounded-2xl font-bold transition hover:bg-black">關閉詳情</button>
         </div>
     </div>
 
     <script>
-        const dateEl = document.getElementById('nav-date');
-        if (dateEl) {
-            dateEl.innerText = new Date().toLocaleDateString('zh-TW', { month: 'long', day: 'numeric', weekday: 'long' });
-        }
+        window.addEventListener('load', () => {
+            const dateEl = document.getElementById('nav-date');
+            if (dateEl) {
+                dateEl.innerText = new Date().toLocaleDateString('zh-TW', { month: 'long', day: 'numeric', weekday: 'long' });
+            }
+        });
     </script>
 </body>
 </html>
