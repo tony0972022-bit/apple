@@ -3,17 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 營運記帳助理-雲端版</title>
-    <script src="[https://cdn.tailwindcss.com](https://cdn.tailwindcss.com)"></script>
-    <script src="[https://cdn.jsdelivr.net/npm/chart.js](https://cdn.jsdelivr.net/npm/chart.js)"></script>
-    <script src="[https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js](https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js)"></script>
+    <title>AI 營運記帳助理 - 家庭共享版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
     <script type="module">
-        import { initializeApp } from "[https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js](https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js)";
-        import { getAuth, signInAnonymously, onAuthStateChanged } from "[https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js](https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js)";
-        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from "[https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js](https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js)";
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // ================================================================
-        // 🛠️ 檢查完畢：Firebase 設定正確 (由截圖 image_7e893e 填入)
+        // 🛠️ Firebase 設定 (已修正網址格式錯誤)
         // ================================================================
         const firebaseConfig = {
             apiKey: "AIzaSyBWrfJ0OkCIMOJw39_HYq4gjTzPP70LODY",
@@ -25,7 +25,7 @@
             measurementId: "G-XE39NRPN02"
         };
         
-        // 🛠️ Gemini API Key (已填入你最新的金鑰)
+        // 🛠️ Gemini API Key
         const geminiApiKey = "AIzaSyBVSFf07Q_KEXWwrRj2LRL6pdt3wGDuG5c"; 
         // ================================================================
 
@@ -44,7 +44,6 @@
                 await signInAnonymously(auth); 
             } catch (e) { 
                 console.error("Firebase Auth Error:", e);
-                alert("Firebase 登入失敗，請確認 Firebase 設定。");
             }
         };
 
@@ -58,14 +57,13 @@
                     renderReport();
                 }, (err) => {
                     console.error("Database Error:", err);
-                    // 這通常是 Rules 沒設好導致的
                 });
             }
         });
 
         initAuth();
 
-        // 🧠 強化的 AI 辨識功能：能自動清洗 JSON 標籤
+        // 🧠 AI 辨識功能
         window.analyzeImage = async (base64Data) => {
             if (!geminiApiKey) return alert("⚠️ 請設定 Gemini API Key！");
             
@@ -100,12 +98,11 @@
                 if (result.error) throw new Error(result.error.message);
                 
                 let text = result.candidates?.[0]?.content?.parts?.[0]?.text;
-                // 清洗 AI 回傳的 Markdown 標記，確保 JSON 可以被正確解析
                 const cleanJson = text.replace(/```json|```/gi, "").trim();
                 return JSON.parse(cleanJson);
 
             } catch (e) { 
-                console.error("AI 辨識詳細錯誤:", e);
+                console.error("AI Analysis Error:", e);
                 alert("AI 辨識發生錯誤：" + e.message);
                 return null; 
             }
@@ -150,7 +147,6 @@
             window.recalc();
         }
 
-        // 新增品項行：自動計算 單價 * 數量
         window.addItemRow = (name = '', qty = 1, unitPrice = 0, cost = 0) => {
             const tr = document.createElement('tr');
             tr.className = "border-b border-gray-50";
@@ -186,7 +182,7 @@
         };
 
         window.submitRecord = async () => {
-            if (!currentUser) return alert("連線尚未就緒...");
+            if (!currentUser) return alert("資料庫尚未就緒...");
             const rev = parseFloat(document.getElementById('edit-revenue').value) || 0;
             const items = [];
             let totalCost = 0;
@@ -208,7 +204,7 @@
                 if (currentEditId) await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', currentEditId), record);
                 else await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'records'), record);
                 alert("儲存成功！"); location.reload();
-            } catch (e) { alert("儲存失敗，請確認 Firebase Rules 是否已發佈。"); }
+            } catch (e) { alert("儲存失敗，請確認 Firebase Rules。"); }
         };
 
         window.editRecord = (id) => {
@@ -272,8 +268,8 @@
                         <td class="py-3 px-2">
                             <div class="font-bold text-gray-800 text-xs sm:text-base">${new Date(r.date).toLocaleDateString()}</div>
                             <div class="flex gap-2 mt-1">
-                                <button onclick="window.viewRecordDetails('${r.id}')" class="text-[10px] text-green-600 font-bold">詳情</button>
-                                <button onclick="window.editRecord('${r.id}')" class="text-[10px] text-blue-500 font-bold">修改</button>
+                                <button onclick="window.viewRecordDetails('${r.id}')" class="text-[10px] text-green-600 font-bold hover:underline">詳情</button>
+                                <button onclick="window.editRecord('${r.id}')" class="text-[10px] text-blue-500 font-bold hover:underline">修改</button>
                                 <button onclick="window.confirmDelete('${r.id}')" class="text-[10px] text-red-400 font-bold">刪除</button>
                             </div>
                         </td>
@@ -308,9 +304,17 @@
         };
 
         window.confirmDelete = (id) => { if(confirm("確定要刪除這天所有的記帳資料嗎？")) deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', id)); };
+
+        // 確保 DOM 載入後再執行
+        window.addEventListener('load', () => {
+            const dateEl = document.getElementById('nav-date');
+            if (dateEl) {
+                dateEl.innerText = new Date().toLocaleDateString('zh-TW', { month: 'long', day: 'numeric', weekday: 'long' });
+            }
+        });
     </script>
     <style>
-        @import url('[https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap](https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap)');
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
         body { font-family: 'Noto Sans TC', sans-serif; background-color: #f8fafc; }
         .chart-container { position: relative; height: 240px; width: 100%; }
         input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
@@ -432,14 +436,5 @@
             <button onclick="document.getElementById('detail-modal').classList.add('hidden')" class="w-full bg-gray-900 text-white py-4 rounded-2xl font-bold transition hover:bg-black">關閉詳情</button>
         </div>
     </div>
-
-    <script>
-        window.addEventListener('load', () => {
-            const dateEl = document.getElementById('nav-date');
-            if (dateEl) {
-                dateEl.innerText = new Date().toLocaleDateString('zh-TW', { month: 'long', day: 'numeric', weekday: 'long' });
-            }
-        });
-    </script>
 </body>
 </html>
