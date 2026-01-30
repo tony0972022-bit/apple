@@ -13,7 +13,7 @@
         import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // ================================================================
-        // 🛠️ Firebase 設定 (已修正網址格式錯誤)
+        // 🛠️ Firebase 設定
         // ================================================================
         const firebaseConfig = {
             apiKey: "AIzaSyBWrfJ0OkCIMOJw39_HYq4gjTzPP70LODY",
@@ -63,7 +63,7 @@
 
         initAuth();
 
-        // 🧠 AI 辨識功能
+        // 🧠 AI 辨識功能 - 修正 API 端點與模型名稱
         window.analyzeImage = async (base64Data) => {
             if (!geminiApiKey) return alert("⚠️ 請設定 Gemini API Key！");
             
@@ -81,11 +81,11 @@
                         { text: prompt }, 
                         { inlineData: { mimeType: "image/png", data: base64Data.split(',')[1] } }
                     ] 
-                }],
-                generationConfig: { responseMimeType: "application/json" }
+                }] 
             };
             
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`;
+            // 將 v1beta 修改為 v1 增加穩定性，並確保模型名稱正確
+            const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`;
             
             try {
                 const response = await fetch(url, { 
@@ -95,7 +95,19 @@
                 });
 
                 const result = await response.json();
-                if (result.error) throw new Error(result.error.message);
+                
+                if (result.error) {
+                    // 如果 v1 也不行，嘗試自動切換回 v1beta (部分新金鑰可能需要)
+                    if (result.error.code === 404) {
+                        const fallbackUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`;
+                        const fallbackRes = await fetch(fallbackUrl, { method: 'POST', body: JSON.stringify(payload) });
+                        const fallbackData = await fallbackRes.json();
+                        const text = fallbackData.candidates?.[0]?.content?.parts?.[0]?.text;
+                        const cleanJson = text.replace(/```json|```/gi, "").trim();
+                        return JSON.parse(cleanJson);
+                    }
+                    throw new Error(result.error.message);
+                }
                 
                 let text = result.candidates?.[0]?.content?.parts?.[0]?.text;
                 const cleanJson = text.replace(/```json|```/gi, "").trim();
@@ -372,7 +384,7 @@
                 <button onclick="window.addItemRow()" class="text-blue-600 font-bold text-sm hover:bg-blue-50 px-4 py-2 rounded-lg">+ 新增品項</button>
                 <div class="grid grid-cols-3 gap-3 pt-6 border-t text-center">
                     <div class="bg-gray-100 p-4 rounded-2xl"><p class="text-[10px] text-gray-400">總成本</p><p id="calc-cost" class="font-black text-gray-800 text-sm">0</p></div>
-                    <div class="bg-green-100 p-4 rounded-2xl"><p class="text-[10px] text-green-500">本日利潤</p><p id="calc-profit" class="font-black text-green-700 text-sm">0</p></div>
+                    <div class="bg-green-100 p-4 rounded-2xl"><p class="text-[10px] text-green-500">利潤</p><p id="calc-profit" class="font-black text-green-700 text-sm">0</p></div>
                     <div class="bg-orange-100 p-4 rounded-2xl"><p class="text-[10px] text-orange-500">分潤 (50%)</p><p id="calc-split" class="font-black text-orange-700 text-sm">0</p></div>
                 </div>
                 <div class="space-y-4 pt-4">
