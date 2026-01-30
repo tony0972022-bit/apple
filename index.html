@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 營運記帳助理 - 專業統計版</title>
+    <title>AI 營運記帳助理 - 安全版</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
@@ -22,7 +22,8 @@
             measurementId: "G-XE39NRPN02"
         };
         
-        const myApiKey = "AIzaSyAHM7BRSnAwR9HlzCJPh5oSujFkYm115nY"; 
+        // 🔑 API Key 改為從 LocalStorage 讀取，預設為空
+        let myApiKey = localStorage.getItem('user_gemini_api_key') || "";
 
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
@@ -44,16 +45,27 @@
                     records.sort((a, b) => new Date(b.date) - new Date(a.date));
                     updateFilterOptions();
                     
-                    const currentTab = document.querySelector('button[class*="bg-blue-600"]').id.replace('btn-tab-', '');
-                    if (currentTab === 'report') renderReport();
-                    if (currentTab === 'stats') renderItemStats();
+                    // 確保元素存在才更新
+                    const activeBtn = document.querySelector('button[class*="bg-blue-600"]');
+                    if(activeBtn) {
+                        const currentTab = activeBtn.id.replace('btn-tab-', '');
+                        if (currentTab === 'report') renderReport();
+                        if (currentTab === 'stats') renderItemStats();
+                    }
                 });
             }
         });
 
         // 🧠 AI 核心功能
         window.analyzeImage = async (base64Data) => {
-            if (!myApiKey) return alert("請先設定 API Key！");
+            // 重新讀取 Key，確保使用者剛設定完能馬上用
+            myApiKey = localStorage.getItem('user_gemini_api_key') || "";
+            
+            if (!myApiKey) {
+                alert("⚠️ 請點擊右上角「⚙️」設定您的 Google API Key 才能使用 AI 功能！");
+                window.openSettings(); // 自動打開設定視窗
+                return null;
+            }
 
             // 顯示 AI 分析中的載入畫面
             const loadingOverlay = document.getElementById('loading-overlay');
@@ -67,6 +79,8 @@
                     const listData = await listResp.json();
                     const validModel = listData.models?.find(m => m.name.includes("gemini") && m.supportedGenerationMethods.includes("generateContent"));
                     if (validModel) modelName = validModel.name;
+                } else if (listResp.status === 400) {
+                    throw new Error("API Key 無效或已過期，請檢查設定。");
                 }
             } catch (e) { console.warn("模型偵測失敗，使用預設值"); }
 
@@ -117,11 +131,10 @@
                 return JSON.parse(text.replace(/```json|```/gi, "").trim());
             } catch (e) { 
                 console.error("AI Error:", e);
-                alert(`辨識失敗：${e.message}`);
+                alert(`辨識失敗：${e.message}\n(如果是 API Key 問題，請點右上角設定更換)`);
                 return null; 
             } finally {
-                // AI 分析結束，隱藏載入畫面 (由 handleFileUpload 接手處理或這裡關閉)
-                // 注意：handleFileUpload 會在 fillEditor 後關閉，這裡先不關閉以免閃爍
+                // AI 分析結束，不在此關閉 loading，由 handleFileUpload 接手
             }
         };
 
@@ -135,11 +148,11 @@
                 document.getElementById('preview-box').classList.remove('hidden');
                 document.getElementById('upload-placeholder').classList.add('hidden');
                 
-                // 這裡呼叫 analyzeImage 會顯示 loading
                 try {
                     const data = await window.analyzeImage(base64);
+                    // 如果分析回傳 null (例如 key 錯誤)，傳入空資料以避免卡住
                     fillEditor(data || { revenue: 0, items: [], date: "" }, base64);
-                    if(!data) alert("AI 無法識別內容，請手動輸入。");
+                    if(!data && myApiKey) alert("AI 無法識別內容，請手動輸入。");
                 } catch (err) {
                     fillEditor({ revenue: 0, items: [], date: "" }, base64);
                 } finally {
@@ -196,7 +209,6 @@
             document.getElementById('calc-split').innerText = Math.max(0, profit * 0.5).toLocaleString();
         };
 
-        // 🟢 修正：存檔時顯示 Loading
         window.submitRecord = async () => {
             if (!currentUser && !confirm("⚠️ 未連線至雲端，僅本地操作。繼續？")) return;
             
@@ -242,7 +254,7 @@
                 location.reload(); 
             } catch (e) { 
                 alert("儲存失敗：" + e.message); 
-                loadingOverlay.classList.add('hidden'); // 失敗時要手動關閉，成功的話 reload 會自動重整
+                loadingOverlay.classList.add('hidden'); 
             }
         };
 
@@ -300,7 +312,6 @@
             document.getElementById('editor-view').scrollIntoView({ behavior: 'smooth' });
         };
 
-        // 🟢 修正：詳情頁面顯示買氣與日記
         window.viewRecordDetails = (id) => {
             const r = records.find(rec => rec.id === id);
             if (!r) return;
@@ -310,7 +321,6 @@
             document.getElementById('view-revenue').innerText = r.revenue.toLocaleString();
             document.getElementById('view-profit').innerText = r.profit.toLocaleString();
             
-            // 這裡補上資料綁定
             document.getElementById('view-market').innerText = r.market || "未記錄";
             document.getElementById('view-mood').innerText = r.mood || "未記錄";
 
@@ -368,8 +378,8 @@
                 if(dateStr.includes('T')) dateStr = dateStr.split('T')[0];
                 const parts = dateStr.split('-');
                 if(parts.length >= 2) {
-                    yearSet.add(parts[0]); // YYYY
-                    monthSet.add(`${parts[0]}-${parts[1]}`); // YYYY-MM
+                    yearSet.add(parts[0]); 
+                    monthSet.add(`${parts[0]}-${parts[1]}`); 
                 }
             });
             
@@ -378,12 +388,10 @@
             
             let optionsHtml = '<option value="all">📅 全部期間</option>';
             
-            // 加入年份選項
             sortedYears.forEach(y => {
                 optionsHtml += `<option value="${y}" class="font-bold text-blue-700">🗓️ ${y}年 (全年)</option>`;
             });
             
-            // 加入月份選項
             sortedMonths.forEach(m => {
                 const [y, mon] = m.split('-');
                 optionsHtml += `<option value="${m}">${y}年 ${mon}月</option>`;
@@ -450,7 +458,6 @@
             updateChart(itemTotals);
         };
 
-        // 📊 改良：品項統計邏輯
         window.renderItemStats = () => {
             const filterVal = document.getElementById('stats-filter').value;
             const tbody = document.getElementById('stats-tbody');
@@ -462,7 +469,6 @@
                 displayRecords = records.filter(r => r.date.startsWith(filterVal));
             }
 
-            // 計算區間總計
             let totalPeriodRevenue = 0;
             let totalPeriodCost = 0;
             let totalPeriodProfit = 0;
@@ -485,13 +491,11 @@
                 });
             });
 
-            // 更新頂部資訊卡
             document.getElementById('card-revenue').innerText = `$${totalPeriodRevenue.toLocaleString()}`;
             document.getElementById('card-cost').innerText = `$${totalPeriodCost.toLocaleString()}`;
             document.getElementById('card-profit').innerText = `$${totalPeriodProfit.toLocaleString()}`;
             document.getElementById('card-qty').innerText = `${totalPeriodQty.toLocaleString()}`;
 
-            // 轉換為陣列並排序 (依銷售數量高到低)
             const sortedItems = Object.keys(itemStats).map(key => ({
                 name: key,
                 ...itemStats[key]
@@ -524,6 +528,22 @@
             itemChart = new Chart(ctx, { type: 'doughnut', data: { labels: labels, datasets: [{ data: Object.values(stats), backgroundColor: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#6366f1'] }] }, options: { responsive: true, maintainAspectRatio: false } });
         }
         
+        // Settings Modal Logic
+        window.openSettings = () => {
+            document.getElementById('settings-modal').classList.remove('hidden');
+            document.getElementById('api-key-input').value = myApiKey;
+        };
+
+        window.saveSettings = () => {
+            const newKey = document.getElementById('api-key-input').value.trim();
+            if(!newKey) return alert("請輸入有效的 API Key");
+            
+            localStorage.setItem('user_gemini_api_key', newKey);
+            myApiKey = newKey;
+            document.getElementById('settings-modal').classList.add('hidden');
+            alert("✅ 設定已儲存！");
+        };
+
         window.confirmDelete = (id) => { if(confirm("確定刪除？")) deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', id)); };
 
         window.addEventListener('load', () => {
@@ -542,10 +562,11 @@
     <nav class="bg-blue-700 text-white p-4 shadow-lg sticky top-0 z-40 flex justify-between items-center">
         <div class="flex items-center gap-2">
             <h1 class="text-xl font-bold">📊 營運助理</h1>
-            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">專業統計版 v7.2</div>
+            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">安全版 v7.3</div>
         </div>
         <div class="flex items-center gap-3">
             <span id="nav-date" class="text-xs opacity-80 hidden sm:inline"></span>
+            <button onclick="window.openSettings()" class="bg-blue-800 p-2 rounded-full hover:bg-blue-600 transition shadow-inner" title="設定 API Key">⚙️</button>
         </div>
     </nav>
 
@@ -677,7 +698,7 @@
                 </select>
             </div>
 
-            <!-- 財務總覽卡片 (新增) -->
+            <!-- 財務總覽卡片 -->
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div class="bg-blue-600 p-5 rounded-2xl shadow-lg text-white">
                     <p class="text-xs opacity-70 mb-1">總銷售額 (Revenue)</p>
@@ -719,6 +740,25 @@
         </section>
     </main>
 
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 hidden">
+        <div class="bg-white w-full max-w-md rounded-3xl shadow-2xl p-6 space-y-4 animate-in zoom-in-95 duration-200">
+            <div class="flex items-center gap-2 text-blue-800">
+                <span class="text-2xl">⚙️</span>
+                <h2 class="text-xl font-bold">API 金鑰設定</h2>
+            </div>
+            <p class="text-xs text-gray-500">請貼上您的 Google Gemini API Key。金鑰將儲存在您的瀏覽器中。</p>
+            
+            <input type="text" id="api-key-input" class="w-full border-2 border-gray-200 rounded-xl p-3 text-sm" placeholder="AIzaSy...">
+            
+            <div class="flex gap-3 pt-4">
+                <button onclick="document.getElementById('settings-modal').classList.add('hidden')" class="flex-1 bg-gray-100 text-gray-500 py-3 rounded-xl font-bold hover:bg-gray-200 transition">取消</button>
+                <button onclick="window.saveSettings()" class="flex-1 bg-blue-600 text-white py-3 rounded-xl font-bold shadow-lg hover:bg-blue-700 transition">儲存設定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detail Modal -->
     <div id="detail-modal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 hidden">
         <div class="bg-white w-full max-w-2xl rounded-[2.5rem] overflow-y-auto max-h-[90vh] shadow-2xl p-8 space-y-8 animate-in zoom-in-95 duration-200">
             <div class="flex justify-between items-center"><h2 id="view-date" class="text-2xl font-black text-blue-700">日期</h2><button onclick="document.getElementById('detail-modal').classList.add('hidden')" class="text-2xl font-bold">✕</button></div>
