@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 營運記帳助理 - 雲端同步旗艦版</title>
+    <title>AI 營運記帳助理 - 水果圖示版</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -32,7 +32,7 @@
 
         let currentUser = null;
         let records = [];
-        let itemMappings = []; // 儲存品項對照表
+        let itemMappings = [];
         let itemChart = null; 
         let currentEditId = null;
         let currentAnalysisResult = "";
@@ -66,13 +66,13 @@
                     }
                 });
 
-                // 2. 🟢 監聽品項對照表 (雲端同步)
+                // 2. 監聽品項對照表
                 onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'item_mappings'), (snapshot) => {
                     itemMappings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    renderMappingList(); // 資料更新時自動刷新 UI
+                    renderMappingList();
                 });
 
-                // 3. 監聽雲端設定 (API Key)
+                // 3. 監聽雲端設定
                 onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'config', 'main'), (docSnap) => {
                     if (docSnap.exists() && docSnap.data().gemini_api_key) {
                         const cloudKey = docSnap.data().gemini_api_key;
@@ -87,7 +87,7 @@
         });
 
         // ==========================================
-        // 🧠 AI 核心功能：圖片辨識 (加入對照表邏輯)
+        // 🧠 AI 核心功能：圖片辨識
         // ==========================================
         window.analyzeImage = async (base64Data) => {
             myApiKey = localStorage.getItem('user_gemini_api_key') || "";
@@ -98,35 +98,30 @@
             }
 
             const loadingOverlay = document.getElementById('loading-overlay');
-            loadingOverlay.querySelector('p').innerText = "AI 正在辨識並校正品項名稱...";
+            loadingOverlay.querySelector('p').innerText = "AI 正在讀取進貨單與營收...";
             loadingOverlay.classList.remove('hidden');
 
             const currentYear = new Date().getFullYear();
             
-            // 🟢 建構對照表提示詞
             let mappingPrompt = "";
             if (itemMappings.length > 0) {
                 const mapList = itemMappings.map(m => `"${m.alias}" -> "${m.standardName}"`).join(", ");
-                mappingPrompt = `
-                【重要：品項名稱校正】
-                請參考以下對照表，如果辨識到的文字類似左邊的「別名」，請務必自動轉換為右邊的「標準名稱」：
-                ${mapList}
-                (例如：看到 "g" 或 "guava" 請輸出 "芭樂")`;
+                mappingPrompt = `【品項校正】請參考對照表：${mapList}。`;
             }
 
-            const prompt = `你是一個專業的記帳助理。請分析這張圖片。這通常是一張包含「進貨/成本明細」的單據，且圖片某處可能寫有當日的「總營業額」。
+            const prompt = `你是一個專業的記帳助理。請分析這張圖片（通常是進貨單或收據）。
             
             ${mappingPrompt}
 
             請回傳 JSON 格式資料，包含以下欄位：
-            1. date (字串): 日期，格式 YYYY-MM-DD。請找尋「日期:」標籤。若只有月日，請補上年份 ${currentYear}。
-            2. revenue (數字): 當日總營業額 (Revenue/Total Sales)。如果圖片上有寫「總收」、「營收」、「Total」等金額，請填入此欄位。若找不到明確的營收數字，請回傳 0。
-            3. items (陣列): 這是成本/進貨清單。
-               - name (字串): 品項名稱 (請應用上述的校正規則)
+            1. date (字串): 日期 YYYY-MM-DD。若只有月日，補上年份 ${currentYear}。
+            2. revenue (數字): 當日總營業額/總收 (Revenue)。若圖片無此資訊回傳 0。
+            3. items (陣列): 成本/進貨清單。
+               - name (字串): 品項名稱
                - qty (數字): 數量
-               - unitPrice (數字): 單價 (這裡是成本單價)
+               - unitPrice (數字): 單價/成本
                - cost (數字): 該行小計 (qty * unitPrice)
-               - note (字串): 備註/規格 (如無則空字串)
+               - note (字串): 備註/規格
 
             請只回傳 JSON 字串，不要有 Markdown 標記。`;
             
@@ -164,7 +159,7 @@
             btnAnalyze.classList.add('opacity-50', 'cursor-not-allowed');
 
             const loadingOverlay = document.getElementById('loading-overlay');
-            loadingOverlay.querySelector('p').innerText = "🤖 AI 顧問正在分析成本結構與獲利能力...";
+            loadingOverlay.querySelector('p').innerText = "🤖 AI 顧問正在分析數據...";
             loadingOverlay.classList.remove('hidden');
 
             let totalRev = 0, totalCost = 0, totalProfit = 0;
@@ -311,7 +306,7 @@
         }
 
         // ==========================================
-        // UI 邏輯
+        // UI 邏輯與驗算功能
         // ==========================================
         window.handleFileUpload = async (e) => {
             const file = e.target.files[0];
@@ -349,19 +344,19 @@
             
             window.tempImage = base64;
             document.getElementById('editor-view').classList.remove('hidden');
-            window.recalc();
+            window.recalc(); // 計算並檢查誤差
         }
 
         window.addItemRow = (name = '', qty = 1, unitPrice = 0, note = '') => {
             const tr = document.createElement('tr');
             tr.className = "border-b border-gray-50 align-top";
             tr.innerHTML = `
-                <td class="py-3 px-1"><input type="text" value="${name}" class="w-full border rounded p-2 item-name text-xs sm:text-sm" placeholder="品項(成本)"></td>
-                <td class="py-3 px-1"><input type="number" value="${qty}" class="w-full border rounded p-2 item-qty text-center text-xs" oninput="window.rowUpdate(this)"></td>
-                <td class="py-3 px-1"><input type="number" value="${unitPrice}" class="w-full border rounded p-2 item-uprice text-right text-xs" placeholder="單價" oninput="window.rowUpdate(this)"></td>
-                <td class="py-3 px-1"><input type="number" value="${qty * unitPrice}" class="w-full border rounded p-2 item-subtotal text-right text-xs bg-gray-50 font-bold" readonly></td>
-                <td class="py-3 px-1"><input type="text" value="${note}" class="w-full border rounded p-2 item-note text-xs text-purple-700 bg-purple-50 placeholder-purple-200" placeholder="備註/客人反應"></td>
-                <td class="py-3 px-1 text-center"><button onclick="this.parentElement.parentElement.remove(); window.recalc()" class="text-red-400 font-bold">✕</button></td>
+                <td class="py-2 px-1"><input type="text" value="${name}" class="w-full border rounded p-2 item-name text-sm min-w-[120px]" placeholder="品項(成本)"></td>
+                <td class="py-2 px-1"><input type="number" value="${qty}" class="w-full border rounded p-2 item-qty text-center text-sm min-w-[60px]" oninput="window.rowUpdate(this)"></td>
+                <td class="py-2 px-1"><input type="number" value="${unitPrice}" class="w-full border rounded p-2 item-uprice text-right text-sm min-w-[80px]" placeholder="單價" oninput="window.rowUpdate(this)"></td>
+                <td class="py-2 px-1"><input type="number" value="${qty * unitPrice}" class="w-full border rounded p-2 item-subtotal text-right text-sm bg-gray-50 font-bold min-w-[80px]" readonly></td>
+                <td class="py-2 px-1"><input type="text" value="${note}" class="w-full border rounded p-2 item-note text-sm text-purple-700 bg-purple-50 placeholder-purple-200 min-w-[150px]" placeholder="備註/客人反應"></td>
+                <td class="py-2 px-1 text-center"><button onclick="this.parentElement.parentElement.remove(); window.recalc()" class="text-red-400 font-bold p-2">✕</button></td>
             `;
             document.getElementById('edit-items-body').appendChild(tr);
             window.recalc();
@@ -375,13 +370,35 @@
             window.recalc();
         };
 
+        // 🟢 驗算邏輯：檢查列表總和與手動輸入的小計
         window.recalc = () => {
             let totalCost = 0;
-            document.querySelectorAll('#edit-items-body tr').forEach(tr => {
+            const errors = [];
+
+            document.querySelectorAll('#edit-items-body tr').forEach((tr, index) => {
+                const name = tr.querySelector('.item-name').value || `第 ${index+1} 項`;
                 const qty = parseFloat(tr.querySelector('.item-qty').value) || 0;
                 const uprice = parseFloat(tr.querySelector('.item-uprice').value) || 0;
-                totalCost += (qty * uprice);
+                const subtotal = parseFloat(tr.querySelector('.item-subtotal').value) || 0;
+                
+                // 檢查單行計算 (允許 1 元誤差)
+                const calcSub = Math.round(qty * uprice);
+                if (Math.abs(calcSub - subtotal) > 1) {
+                    errors.push(`⚠️ [${name}] 計算有誤：${qty} x ${uprice} 應為 ${calcSub}，但顯示 ${subtotal}`);
+                }
+
+                totalCost += subtotal;
             });
+
+            // 更新錯誤顯示區
+            const errorBox = document.getElementById('validation-error-box');
+            if (errors.length > 0) {
+                errorBox.innerHTML = errors.map(e => `<div class="text-red-600 text-xs py-1">${e}</div>`).join('');
+                errorBox.classList.remove('hidden');
+            } else {
+                errorBox.classList.add('hidden');
+                errorBox.innerHTML = '';
+            }
 
             const revenue = parseFloat(document.getElementById('edit-revenue').value) || 0;
             document.getElementById('calc-cost').innerText = totalCost.toLocaleString();
@@ -421,13 +438,14 @@
 
             const record = {
                 revenue: revenue, 
+                // 🟢 隱私修正：不儲存圖片到資料庫
+                // imageBase64: window.tempImage || "", 
                 totalCost: totalCost, 
                 profit: profit, 
                 split: profit * 0.5,
                 items, 
                 market: document.getElementById('diary-market').value, 
                 mood: document.getElementById('diary-mood').value,
-                imageBase64: window.tempImage || "", 
                 date: selectedDate 
             };
 
@@ -456,6 +474,7 @@
             document.getElementById('btn-submit').innerText = "儲存";
             document.getElementById('btn-submit').classList.remove('bg-green-600', 'hover:bg-green-700');
             document.getElementById('btn-submit').classList.add('bg-blue-600');
+            document.getElementById('validation-error-box').classList.add('hidden');
             
             document.getElementById('edit-revenue').value = 0;
             document.getElementById('edit-date').value = new Date().toISOString().split('T')[0];
@@ -476,7 +495,6 @@
             renderMappingList();
         };
 
-        // 🟢 修改：增加 Loading 狀態
         window.addMapping = async () => {
             const alias = document.getElementById('mapping-alias').value.trim();
             const standard = document.getElementById('mapping-standard').value.trim();
@@ -525,7 +543,6 @@
             `).join('');
         };
 
-        // 🟢 刪除確認按鈕
         window.deleteCurrentRecord = () => {
             if (currentEditId) {
                 pendingDeleteId = currentEditId;
@@ -574,7 +591,12 @@
             document.getElementById('btn-submit').classList.remove('bg-blue-600');
             document.getElementById('btn-submit').classList.add('bg-green-600', 'hover:bg-green-700');
 
-            window.tempImage = r.imageBase64;
+            // 編輯時載入圖片 (暫時無法載入舊圖片，因為我們不再儲存圖片至資料庫)
+            // window.tempImage = r.imageBase64; 
+            document.getElementById('img-preview').src = "";
+            document.getElementById('preview-box').classList.add('hidden');
+            document.getElementById('upload-placeholder').classList.remove('hidden');
+
             document.getElementById('edit-revenue').value = r.revenue;
             
             if(r.date) document.getElementById('edit-date').value = r.date.split('T')[0];
@@ -585,9 +607,6 @@
             tbody.innerHTML = '';
             r.items.forEach(i => window.addItemRow(i.name, i.qty, i.unitPrice, i.note || ""));
             
-            document.getElementById('img-preview').src = r.imageBase64 || "";
-            document.getElementById('preview-box').classList.toggle('hidden', !r.imageBase64);
-            document.getElementById('upload-placeholder').classList.toggle('hidden', !!r.imageBase64);
             document.getElementById('editor-view').classList.remove('hidden');
             window.switchTab('record'); window.recalc();
             document.getElementById('editor-view').scrollIntoView({ behavior: 'smooth' });
@@ -605,9 +624,10 @@
             document.getElementById('view-market').innerText = r.market || "未記錄";
             document.getElementById('view-mood').innerText = r.mood || "未記錄";
 
-            document.getElementById('view-image').src = r.imageBase64 || "";
-            document.getElementById('view-image').classList.toggle('hidden', !r.imageBase64);
-            document.getElementById('view-no-image').classList.toggle('hidden', !!r.imageBase64);
+            // 詳情頁也不再顯示圖片
+            document.getElementById('view-image').src = "";
+            document.getElementById('view-image').classList.add('hidden');
+            document.getElementById('view-no-image').classList.remove('hidden');
             
             document.getElementById('view-items-tbody').innerHTML = r.items.map(i => {
                 const noteHtml = i.note ? `<div class="text-[10px] text-purple-600 mt-1">💬 ${i.note}</div>` : '';
@@ -933,7 +953,7 @@
     <nav class="bg-blue-700 text-white p-4 shadow-lg sticky top-0 z-40 flex justify-between items-center">
         <div class="flex items-center gap-2">
             <h1 class="text-xl font-bold">📊 營運助理</h1>
-            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">雲端同步旗艦版 v9.7</div>
+            <div class="text-[10px] bg-white/20 px-2 py-1 rounded">水果圖示版 v9.9</div>
         </div>
         <div class="flex items-center gap-3">
             <button onclick="window.openMappingModal()" class="bg-blue-800 p-2 rounded-full hover:bg-blue-600 transition shadow-inner" title="管理品項名稱">
@@ -961,7 +981,7 @@
             
             <div id="loading-overlay" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center text-white text-center">
                 <div class="bg-white/10 backdrop-blur-md p-10 rounded-3xl shadow-2xl">
-                    <div class="inline-block animate-spin text-5xl mb-4">🧠</div>
+                    <div class="inline-block animate-spin text-6xl mb-4">🍎</div>
                     <p class="text-xl font-bold">AI 正在運作中...</p>
                 </div>
             </div>
@@ -979,15 +999,18 @@
                     <input type="number" id="edit-revenue" class="w-full text-4xl font-black bg-transparent border-b-2 border-blue-200 focus:border-blue-500 outline-none transition" oninput="window.recalc()">
                 </div>
 
+                <!-- 🟢 錯誤驗算提示區 -->
+                <div id="validation-error-box" class="hidden bg-red-50 border border-red-200 rounded-xl p-3 my-2 space-y-1"></div>
+
                 <div class="overflow-x-auto">
                     <table class="w-full text-left text-sm">
                         <thead class="text-gray-400 border-b">
                             <tr>
-                                <th class="pb-3 min-w-[100px]">品項名稱(進貨)</th>
-                                <th class="pb-3 w-14 text-center">數量</th>
-                                <th class="pb-3 w-16 text-right">單價</th>
-                                <th class="pb-3 w-16 text-right">小計</th>
-                                <th class="pb-3 min-w-[100px]">備註</th>
+                                <th class="pb-3 min-w-[120px]">品項名稱(進貨)</th>
+                                <th class="pb-3 w-14 text-center min-w-[60px]">數量</th>
+                                <th class="pb-3 w-16 text-right min-w-[80px]">單價</th>
+                                <th class="pb-3 w-16 text-right min-w-[80px]">小計</th>
+                                <th class="pb-3 min-w-[120px]">備註</th>
                                 <th class="pb-3 w-8"></th>
                             </tr>
                         </thead>
