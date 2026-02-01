@@ -13,7 +13,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc, setDoc, query, where, orderBy, limit, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, collection, onSnapshot, addDoc, updateDoc, deleteDoc, setDoc, query, where, orderBy, limit, getDocs, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyBWrfJ0OkCIMOJw39_HYq4gjTzPP70LODY",
@@ -40,13 +40,16 @@
         let currentWorkSession = null; 
         let todaySession = null; 
         let forecastHistory = [];
+        let commuteStatus = null; // { type: 'to_work'|'to_home', startTime: ISO }
 
         // Automation Flags
-        let autoAction = new URLSearchParams(window.location.search).get('action'); // 'start' or 'end'
+        let autoAction = new URLSearchParams(window.location.search).get('action'); 
+        // Actions: 'depart_home', 'arrive_work', 'depart_work', 'arrive_home'
+        // Compatible legacy: 'start' -> 'arrive_work', 'end' -> 'depart_work'
         let hasProcessedAutoAction = false; 
 
         // Time Adjustment State
-        let pendingTimeAction = null; // 'start', 'end', 'edit_start', 'edit_end'
+        let pendingTimeAction = null; 
         let pendingSessionId = null;
 
         // Charts
@@ -72,12 +75,27 @@
             const calendarInput = document.getElementById('calendar-month-picker');
             if(calendarInput) calendarInput.value = monthStr;
             
-            // 啟動左上角時鐘 (立即執行一次，之後每秒更新)
             updateHeaderClock();
             setInterval(updateHeaderClock, 1000);
+
+            if (!autoAction) {
+                switchTab('work');
+            }
+
+            const fileInput = document.getElementById('fileInput');
+            if (fileInput) {
+                fileInput.removeAttribute('onchange'); 
+                fileInput.addEventListener('change', (e) => {
+                    console.log("File selected");
+                    if (window.handleFileUpload) {
+                        window.handleFileUpload(e);
+                    } else {
+                        alert("系統載入中，請稍後再試...");
+                    }
+                });
+            }
         });
 
-        // 左上角時鐘更新函式
         function updateHeaderClock() {
             const clockEl = document.getElementById('header-clock');
             if(!clockEl) return;
@@ -122,6 +140,16 @@
                 const loader = document.getElementById('initial-loader');
                 if(loader) loader.classList.add('hidden');
 
+                // 監聽通勤狀態 (儲存在 system_status 集合)
+                onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'system_status', 'commute'), (docSnap) => {
+                    if (docSnap.exists()) {
+                        commuteStatus = docSnap.data();
+                    } else {
+                        commuteStatus = null;
+                    }
+                    renderWorkStatus();
+                });
+
                 // 監聽記帳紀錄
                 onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'records'), (snapshot) => {
                     records = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -129,6 +157,15 @@
                     updateFilterOptions();
                     updateWorkStatsFilterOptions(); 
                     
+                    if (!document.getElementById('health-check-modal').classList.contains('hidden')) {
+                        const scanBtn = document.getElementById('btn-scan-dup');
+                        if (scanBtn && scanBtn.innerText.includes('顯示全部')) {
+                            window.scanForDuplicates();
+                        } else {
+                            window.renderHealthList();
+                        }
+                    }
+
                     const activeBtn = document.querySelector('button[class*="bg-blue-600"]');
                     if(activeBtn) {
                         const currentTab = activeBtn.id.replace('btn-tab-', '');
@@ -150,7 +187,6 @@
                 onSnapshot(qAllWork, (snapshot) => {
                     workSessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     
-                    // 修正：使用台灣時間來判斷「今天」
                     const now = new Date();
                     const todayStr = toTaiwanDate(now.toISOString());
                     
@@ -163,13 +199,11 @@
                         const startObj = toTaiwanDate(latestSession.startTime);
                         const isRunning = !latestSession.endTime;
                         
-                        // 取得收攤日期的台灣時間字串 (如果已收攤)
                         let endObj = "";
                         if (latestSession.endTime) {
                             endObj = toTaiwanDate(latestSession.endTime);
                         }
 
-                        // 邏輯優化：放寬顯示標準
                         if (isRunning || startObj === todayStr || endObj === todayStr) {
                             todaySession = latestSession;
                             if (isRunning) {
@@ -186,24 +220,7 @@
                         hasProcessedAutoAction = true;
                         const cleanUrl = window.location.pathname;
                         window.history.replaceState({}, document.title, cleanUrl);
-
-                        if (autoAction === 'start') {
-                            if (!currentWorkSession) {
-                                showToast("🚗 偵測到到達攤位，自動開始營業！");
-                                switchTab('work');
-                                window.startWork(true); 
-                            } else {
-                                showToast("⚠️ 已經在營業中囉！");
-                            }
-                        } else if (autoAction === 'end') {
-                            if (currentWorkSession) {
-                                showToast("🚗 偵測到離開攤位，自動結束營業！");
-                                switchTab('work');
-                                window.endWork(true);
-                            } else {
-                                showToast("⚠️ 目前沒有開攤紀錄，無法自動收攤。", "error");
-                            }
-                        }
+                        handleAutoAction(autoAction);
                     }
                 });
 
@@ -229,6 +246,34 @@
             }
         });
 
+        // 🟢 處理自動化動作
+        async function handleAutoAction(action) {
+            console.log("Processing Auto Action:", action);
+            switchTab('work');
+            
+            if (action === 'depart_home') {
+                await window.departHome();
+            } else if (action === 'arrive_work' || action === 'start') {
+                // start is legacy compatibility
+                if (!currentWorkSession) {
+                    showToast("🚗 抵達攤位，自動開始營業！");
+                    await window.arriveWork(true);
+                } else {
+                    showToast("⚠️ 已經在營業中囉！");
+                }
+            } else if (action === 'depart_work' || action === 'end') {
+                // end is legacy compatibility
+                if (currentWorkSession) {
+                    showToast("🌙 離開攤位，準備返家結算！");
+                    await window.departWork(true);
+                } else {
+                    showToast("⚠️ 目前沒有開攤紀錄。", "error");
+                }
+            } else if (action === 'arrive_home') {
+                await window.arriveHome();
+            }
+        }
+
         // 🟢 輔助函式：將 ISO 時間字串轉為 台灣日期字串 (YYYY-MM-DD)
         function toTaiwanDate(isoStr) {
             if(!isoStr) return "";
@@ -239,6 +284,198 @@
             return taiwanDate.toISOString().split('T')[0];
         }
 
+        // ... (checkDataHealth, renderHealthList, deleteSelectedHealthItems, scanForDuplicates - NO CHANGES)
+        // 🟢 資料庫健康檢查工具 (UI 版) - 整合查詢與刪除
+        window.checkDataHealth = (defaultMonth = null) => {
+            // 隱藏設定 Modal，顯示檢查 Modal
+            document.getElementById('settings-modal').classList.add('hidden');
+            document.getElementById('health-check-modal').classList.remove('hidden');
+            
+            // 預設選擇本月，或傳入的指定月份
+            if (defaultMonth) {
+                document.getElementById('health-filter-month').value = defaultMonth;
+            } else {
+                const today = new Date();
+                const yyyy = today.getFullYear();
+                const mm = String(today.getMonth() + 1).padStart(2, '0');
+                document.getElementById('health-filter-month').value = `${yyyy}-${mm}`;
+            }
+            
+            // 重置按鈕狀態
+            const scanBtn = document.getElementById('btn-scan-dup');
+            if(scanBtn) {
+                scanBtn.innerText = "🔍 自動抓出重複資料";
+                scanBtn.classList.remove('bg-gray-500', 'hover:bg-gray-600');
+                scanBtn.classList.add('bg-orange-500', 'hover:bg-orange-600');
+            }
+            
+            window.renderHealthList();
+        };
+
+        // 渲染檢查清單 - 增加重複資料紅色標記
+        window.renderHealthList = () => {
+            const filterMonth = document.getElementById('health-filter-month').value;
+            const tbody = document.getElementById('health-list-tbody');
+            tbody.innerHTML = '';
+            
+            // 篩選資料 (使用 records 全域變數)
+            const targetRecords = records.filter(r => {
+                if (!r.date) return false;
+                // 寬鬆比對：只要日期字串開頭符合 YYYY-MM 即可
+                return r.date.startsWith(filterMonth);
+            });
+
+            if (targetRecords.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="p-6 text-center text-gray-400">該月份無資料</td></tr>';
+                document.getElementById('health-count').innerText = "0";
+                return;
+            }
+
+            // 依日期排序 (舊到新)
+            targetRecords.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+            // 🟢 偵測重複日期
+            const dateCounts = {};
+            targetRecords.forEach(r => {
+                const d = r.date.split('T')[0];
+                dateCounts[d] = (dateCounts[d] || 0) + 1;
+            });
+
+            targetRecords.forEach(r => {
+                const tr = document.createElement('tr');
+                const d = r.date.split('T')[0];
+                const isDuplicate = dateCounts[d] > 1; // 判斷是否為重複日期
+                
+                // 重複資料標記紅色背景
+                tr.className = `border-b transition ${isDuplicate ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-gray-50'}`;
+                
+                const shortId = r.id.slice(0, 4) + '...';
+                const dateDisplay = r.date.includes('T') ? r.date.split('T')[0] : r.date;
+                
+                tr.innerHTML = `
+                    <td class="p-3 text-center">
+                        <input type="checkbox" class="health-checkbox w-5 h-5 text-blue-600 rounded focus:ring-blue-500 cursor-pointer" value="${r.id}">
+                    </td>
+                    <td class="p-3 text-xs text-gray-400 font-mono">${shortId}</td>
+                    <td class="p-3 text-sm font-bold ${isDuplicate ? 'text-red-700' : 'text-gray-700'}">
+                        ${dateDisplay}
+                        ${isDuplicate ? '<span class="text-[10px] bg-red-200 text-red-800 px-1 rounded ml-1">重複</span>' : ''}
+                    </td>
+                    <td class="p-3 text-sm text-right text-blue-600">$${r.revenue?.toLocaleString() || 0}</td>
+                    <td class="p-3 text-sm text-right text-green-600">$${r.profit?.toLocaleString() || 0}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+            
+            document.getElementById('health-count').innerText = `${targetRecords.length}`;
+        };
+
+        // 全選功能
+        window.toggleSelectAll = (source) => {
+            const checkboxes = document.querySelectorAll('.health-checkbox');
+            checkboxes.forEach(cb => cb.checked = source.checked);
+        };
+
+        // 刪除選取項目
+        window.deleteSelectedHealthItems = async () => {
+            const checkboxes = document.querySelectorAll('.health-checkbox:checked');
+            if (checkboxes.length === 0) return showToast("請先勾選要刪除的項目", "error");
+
+            const count = checkboxes.length;
+            if (!confirm(`⚠️ 媽媽，確定要刪除這 ${count} 筆資料嗎？\n刪除後無法復原喔！`)) return;
+
+            const btn = document.getElementById('btn-health-delete');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = "刪除中...";
+            btn.disabled = true;
+
+            try {
+                const promises = Array.from(checkboxes).map(cb => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'records', cb.value)));
+                await Promise.all(promises);
+                showToast(`✅ 成功刪除 ${count} 筆資料`);
+                // 畫面會透過 onSnapshot 自動更新
+            } catch (e) {
+                showToast("刪除失敗：" + e.message, "error");
+            } finally {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            }
+        };
+        
+        // 🟢 新增：自動抓重複功能
+        window.scanForDuplicates = () => {
+            const btn = document.getElementById('btn-scan-dup');
+            // 如果已經在顯示重複模式，則切換回全部顯示
+            if (btn.innerText.includes('顯示全部')) {
+                window.renderHealthList();
+                btn.innerText = "🔍 自動抓出重複資料";
+                btn.classList.remove('bg-gray-500', 'hover:bg-gray-600');
+                btn.classList.add('bg-orange-500', 'hover:bg-orange-600');
+                return;
+            }
+
+            const filterMonth = document.getElementById('health-filter-month').value;
+            const dateCount = {};
+            
+            // 1. 統計每天出現幾次
+            records.forEach(r => {
+                if (!r.date || !r.date.startsWith(filterMonth)) return;
+                const d = r.date.split('T')[0];
+                if (!dateCount[d]) dateCount[d] = [];
+                dateCount[d].push(r);
+            });
+
+            // 2. 篩選出 > 1 筆的日期
+            let duplicates = [];
+            Object.keys(dateCount).forEach(d => {
+                if (dateCount[d].length > 1) {
+                    duplicates = duplicates.concat(dateCount[d]);
+                }
+            });
+
+            if (duplicates.length === 0) {
+                showToast("✅ 太棒了！本月沒有發現重複日期的資料。");
+                return;
+            }
+
+            // 3. 渲染重複項目
+            // 使用 renderTableRows 邏輯 (這裡簡單重寫一部分，或抽離共用)
+            const tbody = document.getElementById('health-list-tbody');
+            tbody.innerHTML = '';
+            
+            // 依日期排序
+            duplicates.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+            duplicates.forEach(r => {
+                const tr = document.createElement('tr');
+                tr.className = `border-b transition bg-red-50 hover:bg-red-100`;
+                
+                const shortId = r.id.slice(0, 4) + '...';
+                const dateDisplay = r.date.includes('T') ? r.date.split('T')[0] : r.date;
+                
+                tr.innerHTML = `
+                    <td class="p-3 text-center">
+                        <input type="checkbox" class="health-checkbox w-5 h-5 text-blue-600 rounded focus:ring-blue-500 cursor-pointer" value="${r.id}">
+                    </td>
+                    <td class="p-3 text-xs text-gray-400 font-mono">${shortId}</td>
+                    <td class="p-3 text-sm font-bold text-red-700">
+                        ${dateDisplay} <span class="text-[10px] bg-red-200 text-red-800 px-1 rounded ml-1">重複</span>
+                    </td>
+                    <td class="p-3 text-sm text-right text-blue-600">$${r.revenue?.toLocaleString() || 0}</td>
+                    <td class="p-3 text-sm text-right text-green-600">$${r.profit?.toLocaleString() || 0}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            document.getElementById('health-count').innerText = `${duplicates.length} (疑似重複)`;
+            
+            btn.innerText = "📋 顯示全部資料";
+            btn.classList.remove('bg-orange-500', 'hover:bg-orange-600');
+            btn.classList.add('bg-gray-500', 'hover:bg-gray-600');
+            showToast(`⚠️ 發現 ${duplicates.length} 筆重複日期的資料，請檢查！`);
+        };
+
+        // ... (Weather and Forecast logic - NO CHANGES)
         async function fetchTainanWeather() {
             // 增加 uv_index_max
             const url = `https://api.open-meteo.com/v1/forecast?latitude=${TAINAN_LAT}&longitude=${TAINAN_LON}&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,windspeed_10m_max,weathercode,uv_index_max&timezone=Asia%2FTaipei&past_days=2&forecast_days=8`;
@@ -246,7 +483,6 @@
             return await resp.json();
         }
 
-        // 🟢 新增：強制重新預報功能的按鈕邏輯
         window.retryForecast = async (dateStr, btnId) => {
             const btn = document.getElementById(btnId);
             const originalText = btn ? btn.innerHTML : "🔄 重新預報";
@@ -289,10 +525,16 @@
             } else if (todayForecast.queryTime) {
                 const lastUpdate = new Date(todayForecast.queryTime);
                 if (currentHour >= 12 && lastUpdate.getHours() < 12) {
-                     needWeatherUpdate = true;
-                     console.log("🕛 超過 12 點，執行每日例行天氣更新...");
+                      needWeatherUpdate = true;
+                      console.log("🕛 超過 12 點，執行每日例行天氣更新...");
                 }
             }
+            // 🟢 強制更新檢查：如果舊資料沒有 UV 指數，強制更新
+            if (todayForecast && todayForecast.weather && typeof todayForecast.weather.uvIndex === 'undefined') {
+                console.log("Old weather data format detected, forcing update...");
+                needWeatherUpdate = true;
+            }
+
             if (needWeatherUpdate) {
                 await updateWeekWeather();
             }
@@ -343,7 +585,7 @@
 
         window.runAiForecast = async (targetDateStr, isAuto = false) => {
             let forecast = forecastHistory.find(f => f.targetDate === targetDateStr);
-            if (!forecast) {
+            if (!forecast || !forecast.weather || typeof forecast.weather.uvIndex === 'undefined') {
                 await updateWeekWeather();
                 const weatherData = await fetchTainanWeather(); 
                 const idx = weatherData.daily.time.indexOf(targetDateStr);
@@ -360,12 +602,7 @@
                     weatherCode: weatherData.daily.weathercode[idx],
                     uvIndex: weatherData.daily.uv_index_max[idx]
                 }};
-            } else {
-                if(!forecast.weather) {
-                     await updateWeekWeather();
-                     return;
-                }
-            }
+            } 
 
             const w = forecast.weather;
             let windLevel = "微風";
@@ -426,13 +663,14 @@
             1. **拜拜日優先**：台灣習俗中，農曆初一、十五或大節日的前 1-2 天，買水果拜拜是剛性需求。即使天氣稍微不好(小雨)，買氣依然會很強（因為一定要拜）。
             2. **天氣影響**：若無拜拜需求，則主要看天氣。大雨或寒流會降低買氣；天氣熱則消暑水果好賣。
             
-            請用貼心、孝順的口吻（像是兒子對媽媽說話）。
+            請用貼心、孝順的口吻。
             請回傳 JSON 格式 (不要 Markdown)，包含：
             1. buyingMood (string): 高 / 中 / 低 (若遇拜拜日前夕，請傾向評估為「高」或「中高」)
-            2. moodReason (string): 請包含三點內容：(1)簡單天氣說明 (2)節氣或拜拜影響 (3)給媽媽的注意事項。
-               * 🔥 重要時間修正：這份預報是針對「${relativeDayTerm}」。在說明時，請務必使用「${relativeDayTerm}」這個詞開頭（例如：媽，${relativeDayTerm}的天氣...），絕對不能寫錯日期！
-               * 🔥 重要語氣修正：如果預測生意很好(高)，請體貼地說：「媽${relativeDayTerm}會很忙，辛苦了，要注意安全不要太累喔」或「搬重物要小心，腰要注意」，絕對不要說「妳一定會忙不過來」這種讓人壓力的話。
-               * ☀️ 紫外線提醒：如果紫外線指數高(>6)，請提醒媽媽要防曬、戴帽子或多喝水。
+            2. moodReason (string): 請包含三點內容：(1)簡單天氣說明 (2)節氣或拜拜影響 (3)貼心注意事項。
+               * 🔥 重要時間修正：這份預報是針對「${relativeDayTerm}」。在說明時，請務必使用「${relativeDayTerm}」這個詞開頭（例如：${relativeDayTerm}的天氣...），絕對不能寫錯日期！
+               * 🔥 內容修正：請直接講述內容，**不要**在開頭加上「媽」、「媽媽」等稱呼。
+               * 🔥 重要語氣修正：如果預測生意很好(高)，請體貼地提醒：「${relativeDayTerm}會很忙，辛苦了，要注意安全不要太累喔」或「搬重物要小心，腰要注意」，絕對不要說「忙不過來」這種讓人壓力的話。
+               * ☀️ 紫外線提醒：如果紫外線指數高(>6)，請提醒要防曬、戴帽子或多喝水。
                * 請用溫暖口吻整合成一段話 (50字內)。
             3. recommendedFruits (array of strings): 推薦 5 樣適合當天販售的水果 (若遇拜拜日，請推薦 蘋果/鳳梨/香蕉 等適合供桌的水果)
             `;
@@ -463,17 +701,80 @@
             return map[code] || "未知天氣";
         }
 
-        // 5. 開攤/收攤功能 (修改為支援彈窗確認)
+        // ... (handleFileUpload - NO CHANGES)
+        window.handleFileUpload = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            console.log("Handling file upload...");
+            
+            const loadingOverlay = document.getElementById('loading-overlay');
+            if (loadingOverlay) {
+                loadingOverlay.querySelector('p').innerText = "📸 正在讀取照片...";
+                loadingOverlay.classList.remove('hidden');
+            }
+
+            const reader = new FileReader();
+            reader.onload = async (event) => {
+                const base64 = event.target.result;
+                const imgPreview = document.getElementById('img-preview');
+                const previewBox = document.getElementById('preview-box');
+                const uploadPlaceholder = document.getElementById('upload-placeholder');
+                
+                if (imgPreview) imgPreview.src = base64;
+                if (previewBox) previewBox.classList.remove('hidden');
+                if (uploadPlaceholder) uploadPlaceholder.classList.add('hidden');
+
+                try {
+                    if (loadingOverlay) loadingOverlay.querySelector('p').innerText = "🤖 AI 兒子正在分析帳單內容...";
+                    const data = await window.analyzeImage(base64);
+                    fillEditor(data || { revenue: 0, items: [], date: "" }, base64);
+                } catch (err) { 
+                    console.error("Analysis error:", err);
+                    showToast("辨識發生錯誤，請手動輸入", "error");
+                    fillEditor({ revenue: 0, items: [], date: "" }, base64); 
+                } finally { 
+                    if (loadingOverlay) loadingOverlay.classList.add('hidden'); 
+                    e.target.value = '';
+                }
+            };
+            
+            reader.onerror = () => {
+                console.error("File reading failed");
+                showToast("讀取檔案失敗", "error");
+                if (loadingOverlay) loadingOverlay.classList.add('hidden');
+            };
+
+            reader.readAsDataURL(file);
+        };
+
+        // 🟢 新增：出發 (家 -> 攤位)
+        window.departHome = async () => {
+            const now = new Date().toISOString();
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'system_status', 'commute'), {
+                type: 'to_work',
+                startTime: now
+            });
+            showToast("🚗 出發去攤位囉！行車平安！");
+        };
+
+        // 🟢 修改：抵達/開始營業 (支援計算通勤)
         window.startWork = async (isAuto = false) => {
+            // Alias for button click
+            window.arriveWork(isAuto);
+        };
+
+        window.arriveWork = async (isAuto = false) => {
             const btn = document.getElementById('btn-start-work');
             if(btn && !isAuto) btn.disabled = true;
 
             const now = new Date();
+            const nowISO = now.toISOString();
             const offset = now.getTimezoneOffset() * 60000;
             const localISOTime = (new Date(now - offset)).toISOString().slice(0, 16);
 
             if (isAuto) {
-                await confirmTimeAdjustment('start', now.toISOString());
+                await confirmTimeAdjustment('start', nowISO);
                 if(btn) btn.disabled = false;
             } else {
                 pendingTimeAction = 'start';
@@ -482,17 +783,24 @@
             }
         };
 
+        // 🟢 新增：收攤/離開 (支援記錄下班時間，等待到家)
         window.endWork = async (isAuto = false) => {
+            // Alias for button click
+            window.departWork(isAuto);
+        };
+
+        window.departWork = async (isAuto = false) => {
             if (!currentWorkSession) return;
             const btn = document.getElementById('btn-end-work');
             if(btn && !isAuto) btn.disabled = true;
 
             const now = new Date();
+            const nowISO = now.toISOString();
             const offset = now.getTimezoneOffset() * 60000;
             const localISOTime = (new Date(now - offset)).toISOString().slice(0, 16);
 
             if (isAuto) {
-                await confirmTimeAdjustment('end', now.toISOString());
+                await confirmTimeAdjustment('end', nowISO);
                 if(btn) btn.disabled = false;
             } else {
                 pendingTimeAction = 'end';
@@ -501,19 +809,58 @@
             }
         };
 
+        // 🟢 新增：到家 (計算回程通勤，並正式結束營業)
+        window.arriveHome = async () => {
+            if (!commuteStatus || commuteStatus.type !== 'to_home' || !commuteStatus.sessionId) {
+                showToast("⚠️ 找不到收攤後的返家紀錄，無法計算回程。", "error");
+                return;
+            }
+            
+            const now = new Date();
+            const departTime = new Date(commuteStatus.startTime); // 這是離開攤位的時間
+            const diffMins = Math.round((now - departTime) / 60000); // 抵達家裡 - 離開攤位
+            
+            // 這裡我們把「營業結束時間」設為「離開攤位時間」(commuteStatus.startTime)
+            // 並記錄「到家時間」與「回程時長」
+            
+            const sessionToUpdate = workSessions.find(s => s.id === commuteStatus.sessionId);
+            let dayRevenue = 0;
+            let dayProfit = 0;
+            
+            if (sessionToUpdate) {
+                const dayStr = toTaiwanDate(sessionToUpdate.startTime);
+                const todayRecords = records.filter(r => r.date.startsWith(dayStr));
+                todayRecords.forEach(r => {
+                    dayRevenue += (r.revenue || 0);
+                    dayProfit += (r.profit || 0);
+                });
+            }
+
+            // 更新工作 Session，正式結單
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'work_sessions', commuteStatus.sessionId), {
+                endTime: commuteStatus.startTime, // 營業結束時間 = 離開攤位時間
+                finalRevenue: dayRevenue,
+                finalProfit: dayProfit,
+                returnTimeMins: diffMins, // 回程通勤時間
+                arriveHomeTime: now.toISOString() // 實際到家時間
+            });
+
+            // 清除通勤狀態
+            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'system_status', 'commute'));
+            
+            showToast(`🏠 歡迎回家！今日結單，回程花了 ${diffMins} 分鐘。`);
+        };
+
         window.openTimeModal = (title, defaultTime, sessionId = null) => {
             document.getElementById('time-modal-title').innerText = title;
             document.getElementById('time-input').value = defaultTime;
             document.getElementById('time-adjust-modal').classList.remove('hidden');
             pendingSessionId = sessionId;
 
-            // 🟢 新增：根據動作類型顯示或隱藏刪除按鈕
             const delBtn = document.getElementById('btn-delete-time');
             if(delBtn) {
-                // 只有在「修改歷史紀錄」時才顯示刪除按鈕
                 if (pendingTimeAction === 'edit_start' || pendingTimeAction === 'edit_end') {
                     delBtn.classList.remove('hidden');
-                    // 動態更換按鈕文字
                     delBtn.innerText = pendingTimeAction === 'edit_start' ? "🗑️ 刪除整筆紀錄" : "🗑️ 清除收攤時間";
                 } else {
                     delBtn.classList.add('hidden');
@@ -521,7 +868,6 @@
             }
         };
 
-        // 🟢 新增：刪除時間/紀錄功能
         window.deleteTime = async () => {
             if (!pendingSessionId) return;
             
@@ -574,11 +920,22 @@
             }
         };
 
+        // 🟢 修改：整合通勤時間計算的確認邏輯
         async function confirmTimeAdjustment(action, timeIsoString, sessionId = null) {
             try {
                 if (action === 'start') {
                     const todayStr = toTaiwanDate(timeIsoString); 
                     let weatherSnapshot = {};
+                    let commuteMins = 0;
+
+                    // 計算去程通勤
+                    if (commuteStatus && commuteStatus.type === 'to_work') {
+                        const departTime = new Date(commuteStatus.startTime);
+                        const arriveTime = new Date(timeIsoString);
+                        commuteMins = Math.round((arriveTime - departTime) / 60000);
+                        // 清除通勤狀態
+                        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'system_status', 'commute'));
+                    }
                     
                     let todayForecast = forecastHistory.find(f => f.targetDate === todayStr);
                     if (!todayForecast) {
@@ -602,29 +959,28 @@
                     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'work_sessions'), {
                         startTime: timeIsoString,
                         endTime: null,
-                        weatherSnapshot: weatherSnapshot
+                        weatherSnapshot: weatherSnapshot,
+                        departHomeTime: commuteStatus ? commuteStatus.startTime : null,
+                        commuteTimeMins: commuteMins // 記錄去程時間
                     });
-                    showToast("🚀 開始營業囉！媽媽加油！");
+                    
+                    let msg = "🚀 開始營業囉！媽媽加油！";
+                    if (commuteMins > 0) msg += ` (通勤: ${commuteMins}分)`;
+                    showToast(msg);
 
                 } else if (action === 'end') {
                     const sessionToUpdate = currentWorkSession;
                     if (!sessionToUpdate) throw new Error("無進行中的營業紀錄");
 
-                    const dayStr = toTaiwanDate(sessionToUpdate.startTime);
-                    const todayRecords = records.filter(r => r.date.startsWith(dayStr));
-                    let dayRevenue = 0;
-                    let dayProfit = 0;
-                    todayRecords.forEach(r => {
-                        dayRevenue += (r.revenue || 0);
-                        dayProfit += (r.profit || 0);
+                    // 🟢 修正：如果是「收攤」，只記錄狀態，不更新 Work Session 的 endTime
+                    // 設定回程通勤狀態
+                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'system_status', 'commute'), {
+                        type: 'to_home',
+                        startTime: timeIsoString, // 這是離開攤位的時間
+                        sessionId: sessionToUpdate.id
                     });
 
-                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'work_sessions', sessionToUpdate.id), {
-                        endTime: timeIsoString,
-                        finalRevenue: dayRevenue,
-                        finalProfit: dayProfit
-                    });
-                    showToast("🌙 結束營業！媽媽辛苦了，早點休息！");
+                    showToast("🌙 離開攤位！系統已記錄時間，待您到家後結算。");
 
                 } else if (action === 'edit_start' && sessionId) {
                     await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'work_sessions', sessionId), {
@@ -669,19 +1025,38 @@
             let statusHtml = `<span class="bg-gray-100 text-gray-500 px-3 py-1 rounded-full text-xs font-bold">💤 尚未營業</span>`;
             let actionBtn = `
                 <button id="btn-start-work" onclick="window.startWork()" class="w-full py-5 bg-blue-600 hover:bg-blue-700 text-white font-black text-2xl rounded-2xl shadow-xl transition transform active:scale-95 flex items-center justify-center gap-2">
-                    🚀 開始營業
+                    🚀 抵達開攤
                 </button>`;
 
-            if (todaySession) {
-                if (todaySession.endTime) {
-                    statusHtml = `<span class="bg-red-100 text-red-600 px-3 py-1 rounded-full text-xs font-bold">🌙 已結束營業</span>`;
-                    actionBtn = `<div class="w-full py-4 bg-gray-100 text-gray-400 font-bold text-center rounded-2xl border-2 border-dashed border-gray-200">今日營業結束</div>`;
-                } else {
-                    statusHtml = `<span class="bg-green-100 text-green-600 px-3 py-1 rounded-full text-xs font-bold animate-pulse">🟢 營業中</span>`;
+            // 🟢 檢查通勤狀態
+            if (commuteStatus) {
+                if (commuteStatus.type === 'to_work') {
+                    statusHtml = `<span class="bg-blue-100 text-blue-600 px-3 py-1 rounded-full text-xs font-bold animate-pulse">🚗 趕路去攤位中...</span>`;
+                } else if (commuteStatus.type === 'to_home') {
+                    statusHtml = `<span class="bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-xs font-bold animate-pulse">🏠 收攤返家中...</span>`;
                     actionBtn = `
-                        <button id="btn-end-work" onclick="window.endWork()" class="w-full py-5 bg-red-500 hover:bg-red-600 text-white font-black text-2xl rounded-2xl shadow-xl transition transform active:scale-95 flex items-center justify-center gap-2">
-                            🌙 結束營業
+                        <button onclick="window.arriveHome()" class="w-full py-5 bg-orange-500 hover:bg-orange-600 text-white font-black text-2xl rounded-2xl shadow-xl transition transform active:scale-95 flex items-center justify-center gap-2">
+                            🏠 抵達家門 (結算)
                         </button>`;
+                }
+            }
+
+            if (todaySession) {
+                if (!todaySession.endTime) {
+                    statusHtml = `<span class="bg-green-100 text-green-600 px-3 py-1 rounded-full text-xs font-bold animate-pulse">🟢 營業中</span>`;
+                    
+                    // 如果正在返家途中，按鈕已經被上面的邏輯覆蓋成「抵達家門」
+                    // 如果沒有在返家途中，則顯示「離開收攤」
+                    if (!commuteStatus || commuteStatus.type !== 'to_home') {
+                        actionBtn = `
+                            <button id="btn-end-work" onclick="window.endWork()" class="w-full py-5 bg-red-500 hover:bg-red-600 text-white font-black text-2xl rounded-2xl shadow-xl transition transform active:scale-95 flex items-center justify-center gap-2">
+                                🌙 離開收攤
+                            </button>`;
+                    }
+                } else if (!commuteStatus) {
+                    // 已結束且無返家狀態
+                    statusHtml = `<span class="bg-gray-200 text-gray-600 px-3 py-1 rounded-full text-xs font-bold">🌙 本日已結案</span>`;
+                    actionBtn = `<div class="w-full py-4 bg-gray-100 text-gray-400 font-bold text-center rounded-2xl border-2 border-dashed border-gray-200">今日營業結束</div>`;
                 }
             }
 
@@ -691,7 +1066,7 @@
             }
         }
 
-        // 7. 渲染預測 UI
+        // ... (renderForecastUI, getWeatherIcon, updateWorkStatsFilterOptions - NO CHANGES)
         function renderForecastUI() {
             const todayStr = toTaiwanDate(new Date().toISOString());
             const todayForecast = forecastHistory.find(f => f.targetDate === todayStr);
@@ -707,13 +1082,11 @@
                     const f = forecastHistory.find(f => f.targetDate === dStr);
                     const isToday = i === 0;
 
-                    // 🟢 新增：計算農曆日期
                     let lunarStr = "";
                     try {
                         if (typeof Lunar !== 'undefined') {
                             const lDate = Lunar.fromDate(d);
                             lunarStr = lDate.getDayInChinese();
-                            // 如果是初一，顯示月份比較清楚 (e.g., 正月初一)
                             if (lDate.getDay() === 1) {
                                 lunarStr = lDate.getMonthInChinese() + "月" + lunarStr;
                             }
@@ -791,13 +1164,13 @@
                             ? "text-xs bg-white/20 hover:bg-white/30 text-white px-3 py-1.5 rounded-lg transition backdrop-blur-sm font-bold flex items-center gap-1 ring-1 ring-white/30"
                             : "text-xs bg-gray-200 hover:bg-gray-300 text-gray-600 px-3 py-1.5 rounded-lg transition font-bold flex items-center gap-1";
 
-                        const uvIdx = f.weather.uvIndex || 0;
+                        const uvIdx = (f.weather.uvIndex !== undefined) ? f.weather.uvIndex : "-";
                         let uvClass = "bg-gray-100 text-gray-500";
                         if(uvIdx >= 6) uvClass = "bg-orange-100 text-orange-600 font-bold";
                         if(uvIdx >= 8) uvClass = "bg-red-100 text-red-600 font-black animate-pulse";
 
                         const tempMinClass = i === 1 ? 'border-white/30 bg-white/10' : 'border-blue-200 bg-blue-50 text-blue-700';
-                        const tempMaxClass = i === 1 ? 'border-white/30 bg-white/10' : 'border-orange-200 bg-orange-50 text-orange-700';
+                        const tempMaxClass = i === 1 ? 'border-orange-200 bg-orange-50 text-orange-700' : 'border-orange-200 bg-orange-50 text-orange-700';
 
                         const card = document.createElement('div');
                         card.className = `bg-gradient-to-br ${bgClass} rounded-3xl p-5 transform transition hover:scale-[1.01] mb-4 relative overflow-hidden`;
@@ -811,8 +1184,8 @@
                                     🔄 重新預報
                                 </button>
                             </div>
-                            <div class="flex flex-col sm:flex-row gap-4">
-                                <div class="flex-1">
+                            <div class="flex flex-col gap-4">
+                                <div class="w-full">
                                     <p class="${textClass} text-xs font-bold mb-2 flex flex-wrap items-center gap-2">
                                         <span class="bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded shadow-sm border border-blue-200">📍 台南市</span>
                                         <span>${getWeatherDesc(f.weather.weatherCode)}</span>
@@ -827,15 +1200,6 @@
                                         <span class="text-4xl font-black ${moodColor}">買氣：${ai.buyingMood}</span>
                                     </div>
                                     <p class="text-sm opacity-95 leading-relaxed text-justify font-medium">👦 ${ai.moodReason}</p>
-                                </div>
-                                <div class="${i===1 ? 'bg-white/10 border-white/20 text-white' : 'bg-gray-100 border-gray-200 text-gray-600'} border rounded-2xl p-3 min-w-[120px] backdrop-blur-sm">
-                                    <p class="text-[10px] opacity-70 mb-1 font-bold uppercase tracking-wider">✨ 兒子推薦主打</p>
-                                    <ul class="text-sm font-bold space-y-1 list-none">
-                                        ${ai.recommendedFruits.slice(0,5).map(fruit => {
-                                            const emoji = getFruitEmoji(fruit);
-                                            return `<li>${emoji} ${fruit}</li>`;
-                                        }).join('')}
-                                    </ul>
                                 </div>
                             </div>
                         `;
@@ -937,7 +1301,7 @@
 
             const sortedDates = Array.from(relevantDates).sort().reverse();
 
-            let totalRev = 0, totalProf = 0, totalHours = 0, workDays = 0, totalSplit = 0; // 🟢 新增：總分潤變數
+            let totalRev = 0, totalProf = 0, totalHours = 0, workDays = 0, totalSplit = 0; 
 
             sortedDates.forEach(dateStr => {
                 const session = workSessions.find(w => toTaiwanDate(w.startTime) === dateStr);
@@ -948,12 +1312,21 @@
                 dayRecords.forEach(r => { dRev += (r.revenue||0); dProf += (r.profit||0); if(r.market) dMarket = r.market; });
 
                 let startT = "-", endT = "-", duration = 0, durationStr = "-";
+                let commuteStr = "";
                 let startEditBtn = "", endEditBtn = "";
 
                 if (session) {
                     const sTime = new Date(session.startTime);
                     startT = sTime.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
                     startEditBtn = `<button onclick="window.editSessionTime('${session.id}', 'start', '${session.startTime}')" class="text-blue-400 hover:text-blue-600 text-xs ml-1">✎</button>`;
+
+                    // 🟢 顯示通勤資訊
+                    if (session.commuteTimeMins) {
+                        commuteStr += `<div class="text-[10px] text-gray-400">去:${session.commuteTimeMins}分</div>`;
+                    }
+                    if (session.returnTimeMins) {
+                        commuteStr += `<div class="text-[10px] text-gray-400">回:${session.returnTimeMins}分</div>`;
+                    }
 
                     if (session.endTime) {
                         const eTime = new Date(session.endTime);
@@ -975,16 +1348,23 @@
                 totalProf += dProf;
 
                 const split = Math.round(dProf * 0.5);
-                totalSplit += split; // 🟢 新增：累加分潤
+                totalSplit += split; 
                 const predMood = forecast && forecast.aiPrediction ? forecast.aiPrediction.buyingMood : "-";
                 
                 const tr = document.createElement('tr');
                 tr.className = "border-b hover:bg-gray-50 text-sm";
                 tr.innerHTML = `
                     <td class="p-3 font-bold text-gray-700">${dateStr.slice(5)}</td>
-                    <td class="p-3 text-gray-500 whitespace-nowrap">${startT}${startEditBtn}</td>
-                    <td class="p-3 text-gray-500 whitespace-nowrap">${endT}${endEditBtn}</td>
-                    <td class="p-3 font-mono text-blue-600">${durationStr}</td>
+                    <td class="p-3 text-gray-500 whitespace-nowrap">
+                        ${startT}${startEditBtn}
+                    </td>
+                    <td class="p-3 text-gray-500 whitespace-nowrap">
+                        ${endT}${endEditBtn}
+                    </td>
+                    <td class="p-3 font-mono text-blue-600">
+                        ${durationStr}
+                        ${commuteStr}
+                    </td>
                     <td class="p-3 text-right font-bold text-gray-800">$${dRev.toLocaleString()}</td>
                     <td class="p-3 text-right font-bold ${dProf >= 0 ? 'text-green-600' : 'text-red-600'}">$${dProf.toLocaleString()}</td>
                     <td class="p-3 text-right font-bold text-orange-500">$${split.toLocaleString()}</td>
@@ -998,11 +1378,10 @@
             document.getElementById('stats-avg-hours').innerText = avgHours + " hr";
             document.getElementById('stats-sum-revenue').innerText = "$" + totalRev.toLocaleString();
             document.getElementById('stats-sum-profit').innerText = "$" + totalProf.toLocaleString();
-            document.getElementById('stats-sum-split').innerText = "$" + totalSplit.toLocaleString(); // 🟢 新增：顯示總分潤
+            document.getElementById('stats-sum-split').innerText = "$" + totalSplit.toLocaleString(); 
         }
 
-        // ... existing functions (analyzeImage, runAiAnalysis, saveAiAnalysis, etc.) ...
-        // (Keeping all previously defined functions)
+        // ... (The rest of the code remains the same: analyzeImage, runAiAnalysis, saveAiAnalysis, etc.)
         window.analyzeImage = async (base64Data) => {
             myApiKey = localStorage.getItem('user_gemini_api_key') || "";
             if (!myApiKey) {
@@ -1219,22 +1598,50 @@
             return json.candidates?.[0]?.content?.parts?.[0]?.text || "";
         }
 
-        // ... existing UI logic ...
+        // ... (UI logic same as before)
         window.handleFileUpload = async (e) => {
             const file = e.target.files[0];
             if (!file) return;
+
+            console.log("Handling file upload...");
+            
+            const loadingOverlay = document.getElementById('loading-overlay');
+            if (loadingOverlay) {
+                loadingOverlay.querySelector('p').innerText = "📸 正在讀取照片...";
+                loadingOverlay.classList.remove('hidden');
+            }
+
             const reader = new FileReader();
             reader.onload = async (event) => {
                 const base64 = event.target.result;
-                document.getElementById('img-preview').src = base64;
-                document.getElementById('preview-box').classList.remove('hidden');
-                document.getElementById('upload-placeholder').classList.add('hidden');
+                const imgPreview = document.getElementById('img-preview');
+                const previewBox = document.getElementById('preview-box');
+                const uploadPlaceholder = document.getElementById('upload-placeholder');
+                
+                if (imgPreview) imgPreview.src = base64;
+                if (previewBox) previewBox.classList.remove('hidden');
+                if (uploadPlaceholder) uploadPlaceholder.classList.add('hidden');
+
                 try {
+                    if (loadingOverlay) loadingOverlay.querySelector('p').innerText = "🤖 AI 兒子正在分析帳單內容...";
                     const data = await window.analyzeImage(base64);
                     fillEditor(data || { revenue: 0, items: [], date: "" }, base64);
-                } catch (err) { fillEditor({ revenue: 0, items: [], date: "" }, base64); } 
-                finally { document.getElementById('loading-overlay').classList.add('hidden'); }
+                } catch (err) { 
+                    console.error("Analysis error:", err);
+                    showToast("辨識發生錯誤，請手動輸入", "error");
+                    fillEditor({ revenue: 0, items: [], date: "" }, base64); 
+                } finally { 
+                    if (loadingOverlay) loadingOverlay.classList.add('hidden'); 
+                    e.target.value = '';
+                }
             };
+            
+            reader.onerror = () => {
+                console.error("File reading failed");
+                showToast("讀取檔案失敗", "error");
+                if (loadingOverlay) loadingOverlay.classList.add('hidden');
+            };
+
             reader.readAsDataURL(file);
         };
 
@@ -1306,6 +1713,19 @@
             if (!currentUser && !confirm("⚠️ 未連線至雲端，僅本地操作。繼續？")) return;
             const selectedDate = document.getElementById('edit-date').value; 
             if (!selectedDate) return showToast("請確認日期！", "error");
+
+            if (!currentEditId) {
+                const existing = records.find(r => r.date.startsWith(selectedDate));
+                if (existing) {
+                    alert(`⛔ 日期重複請確認！\n\n系統偵測到 ${selectedDate} 已經有資料了。\n(已存在金額: $${existing.revenue})`);
+                    const dateInput = document.getElementById('edit-date');
+                    dateInput.focus();
+                    dateInput.classList.add('ring-4', 'ring-red-500', 'animate-pulse'); 
+                    setTimeout(() => dateInput.classList.remove('ring-4', 'ring-red-500', 'animate-pulse'), 3000);
+                    return; 
+                }
+            }
+
             const loadingOverlay = document.getElementById('loading-overlay');
             loadingOverlay.querySelector('p').innerText = "☁️ 資料上傳存檔中...";
             loadingOverlay.classList.remove('hidden');
@@ -1512,17 +1932,14 @@
                 const isToday = isCurrentMonth && today.getDate() === day;
                 const hasData = data && data.revenue > 0;
                 
-                // 🟢 新增：計算每一天的農曆
                 const targetDate = new Date(year, month, day);
                 let lunarText = "";
                 try {
                     if (typeof Lunar !== 'undefined') {
                         const l = Lunar.fromDate(targetDate);
-                        // 如果是初一，顯示月份 (如: 正月)，否則顯示日期 (如: 初二)
                         if (l.getDay() === 1) lunarText = l.getMonthInChinese() + "月";
                         else lunarText = l.getDayInChinese();
                         
-                        // 如果有節氣 (如: 立春)，優先顯示節氣
                         const jq = l.getJieQi();
                         if (jq) lunarText = jq;
                     }
@@ -1540,7 +1957,6 @@
                     cell.setAttribute('onclick', `window.viewDailyReport('${fullDate}')`);
                 }
 
-                // 🟢 修改：加大字體，優化老花眼閱讀體驗
                 let content = `
                     <div class="w-full flex justify-between items-baseline px-0.5 mb-1">
                         <span class="text-lg sm:text-2xl font-black ${isToday ? 'text-yellow-800' : 'text-gray-800'}">${day}</span>
@@ -2283,29 +2699,15 @@
         
         <!-- 頁面 0: 營運打卡 (Work Session & Forecast) -->
         <section id="page-work" class="hidden space-y-6">
-            <!-- 上半部: 營運狀態 (New UI) -->
-            <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 mb-6">
-                <div id="work-status-badge" class="text-center mb-4">
-                    <!-- Dynamic Status Badge -->
-                    <span class="bg-gray-100 text-gray-500 px-3 py-1 rounded-full text-xs font-bold">💤 尚未營業</span>
-                </div>
-                
-                <div id="work-action-area">
-                    <!-- Dynamic Buttons -->
-                </div>
-
-                <div class="mt-4 text-center text-sm text-gray-400 font-bold bg-orange-50/50 py-2 rounded-lg" id="today-lunar-info"></div>
-            </div>
-
-            <!-- 下半部: AI 買氣預報系統 -->
+            
+            <!-- 1. AI 買氣預報系統 (移至最上方) -->
             <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
                 <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-2">
-                    <!-- 🟢 修正標題：移除(台南市)，改回簡潔版 -->
                     <h2 class="text-xl font-bold text-indigo-900 flex items-center gap-2">🔮 預報專區</h2>
                     <p class="text-[10px] text-indigo-400 bg-indigo-50 px-2 py-1 rounded">系統每日自動更新 (今日 & 明日)</p>
                 </div>
 
-                <!-- 🟢 修改：將未來一週天氣移到最上面 -->
+                <!-- 未來一週天氣 -->
                 <div class="mb-6">
                     <p class="text-xs font-bold text-gray-400 mb-3 ml-1">📅 台南市氣溫預報 (清晨低溫 / 白天高溫) - 未來一週</p>
                     <div id="forecast-weather-container" class="flex gap-2 overflow-x-auto pb-4 scrollbar-hide">
@@ -2320,7 +2722,21 @@
                 </div>
             </div>
 
-            <!-- 營運統計報表 -->
+            <!-- 2. 營運狀態 (移至第二順位) -->
+            <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
+                <div id="work-status-badge" class="text-center mb-4">
+                    <!-- Dynamic Status Badge -->
+                    <span class="bg-gray-100 text-gray-500 px-3 py-1 rounded-full text-xs font-bold">💤 尚未營業</span>
+                </div>
+                
+                <div id="work-action-area">
+                    <!-- Dynamic Buttons -->
+                </div>
+
+                <div class="mt-4 text-center text-sm text-gray-400 font-bold bg-orange-50/50 py-2 rounded-lg" id="today-lunar-info"></div>
+            </div>
+
+            <!-- 3. 營運統計報表 (維持在底部) -->
             <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="text-xl font-bold text-gray-800 flex items-center gap-2">📈 營運統計報表</h2>
@@ -2329,7 +2745,6 @@
                     </select>
                 </div>
 
-                <!-- 🟢 修改：將 grid 從 3 改為 2 (手機) / 4 (電腦) 以容納總分潤 -->
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 text-center">
                     <div class="bg-blue-50 p-3 rounded-2xl">
                         <p class="text-[10px] text-blue-400 mb-1">平均工時</p>
@@ -2343,7 +2758,6 @@
                         <p class="text-[10px] text-orange-400 mb-1">總利潤</p>
                         <p id="stats-sum-profit" class="text-lg font-bold text-orange-700">-</p>
                     </div>
-                    <!-- 🟢 新增：總分潤卡片 -->
                     <div class="bg-purple-50 p-3 rounded-2xl">
                         <p class="text-[10px] text-purple-400 mb-1">總分潤 (50%)</p>
                         <p id="stats-sum-split" class="text-lg font-bold text-purple-700">-</p>
@@ -2357,7 +2771,7 @@
                                 <th class="p-2 whitespace-nowrap">日期</th>
                                 <th class="p-2 whitespace-nowrap">開攤</th>
                                 <th class="p-2 whitespace-nowrap">收攤</th>
-                                <th class="p-2 whitespace-nowrap">工時</th>
+                                <th class="p-2 whitespace-nowrap">工時 (通勤)</th>
                                 <th class="p-2 text-right whitespace-nowrap">營業額</th>
                                 <th class="p-2 text-right whitespace-nowrap">利潤</th>
                                 <th class="p-2 text-right whitespace-nowrap">分潤(50%)</th>
@@ -2376,7 +2790,7 @@
              <div class="bg-white p-10 rounded-3xl shadow-sm border-2 border-dashed border-blue-200 text-center cursor-pointer hover:bg-blue-50 transition" onclick="document.getElementById('fileInput').click()">
                 <div id="upload-placeholder"><div class="text-6xl mb-4">📸</div><p class="text-xl font-bold text-gray-700">拍攝記帳</p><p class="text-sm text-gray-400">AI 正在幫你辨識日期、總營收與進貨成本...</p></div>
                 <div id="preview-box" class="hidden"><img id="img-preview" class="max-h-72 mx-auto rounded-2xl shadow-lg mb-4"></div>
-                <input type="file" id="fileInput" class="hidden" accept="image/*" onchange="handleFileUpload(event)">
+                <input type="file" id="fileInput" class="hidden" accept="image/*">
             </div>
             
             <div id="loading-overlay" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center text-white text-center">
@@ -2640,9 +3054,60 @@
             </div>
             <p class="text-xs text-gray-500">請貼上您的 Google Gemini API Key。金鑰將儲存於雲端，方便跨裝置使用。</p>
             <input type="text" id="api-key-input" class="w-full border-2 border-gray-200 rounded-xl p-3 text-sm" placeholder="AIzaSy...">
+            
+            <button id="btn-health-check" onclick="window.checkDataHealth()" class="w-full bg-orange-100 text-orange-700 py-3 rounded-xl font-bold border border-orange-200 hover:bg-orange-200 transition mt-4 flex items-center justify-center gap-2">
+                <span>🏥</span> 資料庫健康檢查與管理
+            </button>
+
             <div class="flex gap-3 pt-4">
                 <button onclick="document.getElementById('settings-modal').classList.add('hidden')" class="flex-1 bg-gray-100 text-gray-500 py-3 rounded-xl font-bold hover:bg-gray-200 transition">取消</button>
                 <button onclick="window.saveSettings()" class="flex-1 bg-blue-600 text-white py-3 rounded-xl font-bold shadow-lg hover:bg-blue-700 transition">儲存設定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 🟢 新增：資料庫健康檢查 Modal -->
+    <div id="health-check-modal" class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 hidden">
+        <div class="bg-white w-full max-w-2xl rounded-3xl shadow-2xl p-6 space-y-4 animate-in zoom-in-95 duration-200 h-[80vh] flex flex-col">
+            <div class="flex justify-between items-center border-b pb-4">
+                <div class="flex items-center gap-2 text-gray-800">
+                    <span class="text-2xl">🏥</span>
+                    <h3 class="text-xl font-bold">資料管理後台</h3>
+                </div>
+                <button onclick="document.getElementById('health-check-modal').classList.add('hidden')" class="text-gray-400 hover:text-gray-800 text-2xl">✕</button>
+            </div>
+            
+            <div class="flex flex-col gap-3">
+                <div class="flex items-center gap-3 bg-gray-50 p-3 rounded-xl">
+                    <label class="text-sm font-bold text-gray-600">查詢月份：</label>
+                    <input type="month" id="health-filter-month" class="border border-gray-300 rounded-lg px-3 py-1 text-sm outline-none focus:border-blue-500" onchange="window.renderHealthList()">
+                    <div class="flex-1 text-right text-xs text-gray-400">共 <span id="health-count" class="font-bold text-blue-600">0</span> 筆</div>
+                </div>
+
+                <button id="btn-scan-dup" onclick="window.scanForDuplicates()" class="w-full bg-orange-500 hover:bg-orange-600 text-white py-2 rounded-xl text-sm font-bold shadow transition flex items-center justify-center gap-2">
+                    🔍 自動抓出重複資料
+                </button>
+            </div>
+
+            <div class="flex-1 overflow-y-auto border rounded-xl mt-2">
+                <table class="w-full text-left">
+                    <thead class="bg-gray-100 text-gray-500 text-xs sticky top-0 z-10">
+                        <tr>
+                            <th class="p-3 text-center w-10"><input type="checkbox" onclick="window.toggleSelectAll(this)" class="w-4 h-4 rounded"></th>
+                            <th class="p-3 w-20">ID</th>
+                            <th class="p-3">日期</th>
+                            <th class="p-3 text-right">營業額</th>
+                            <th class="p-3 text-right">利潤</th>
+                        </tr>
+                    </thead>
+                    <tbody id="health-list-tbody" class="divide-y divide-gray-100"></tbody>
+                </table>
+            </div>
+
+            <div class="pt-2">
+                <button id="btn-health-delete" onclick="window.deleteSelectedHealthItems()" class="w-full bg-red-500 hover:bg-red-600 text-white py-3 rounded-xl font-bold shadow-lg transition flex items-center justify-center gap-2">
+                    🗑️ 刪除選取項目
+                </button>
             </div>
         </div>
     </div>
